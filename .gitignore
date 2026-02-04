@@ -1,0 +1,40 @@
+# =====================
+# Virtual environments
+# =====================
+.venv/
+ai_env/
+env/
+
+# =====================
+# Python cache
+# =====================
+__pycache__/
+*.pyc
+
+# =====================
+# Jupyter
+# =====================
+.ipynb_checkpoints/
+
+# =====================
+# Environment variables
+# =====================
+.env
+
+# =====================
+# Vector DB / embeddings
+# =====================
+chroma_db/
+faiss_index/
+vector_store/
+
+# =====================
+# OS files
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# VSCode
+# =====================
+.vscode/
