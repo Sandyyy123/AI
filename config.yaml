@@ -1,0 +1,9 @@
+llm:
+  provider: openrouter
+  model: gpt-4o-mini
+  temperature: 0.3
+
+rag:
+  chunk_size: 500
+  chunk_overlap: 50
+  embedding_model: text-embedding-3-small
