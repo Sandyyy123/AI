@@ -27,6 +27,7 @@ __pycache__/
 chroma_db/
 faiss_index/
 vector_store/
+chroma_db_*/
 
 # =====================
 # OS files
@@ -38,3 +39,4 @@ Thumbs.db
 # VSCode
 # =====================
 .vscode/
+*.code-workspace

@@ -144,7 +144,17 @@ AI_RAG_PROJECT/
  └── packages
 
 git status -sb
+![alt text](image.png)
+# main = Currenly on main branch
+# m = modified files
+# ?? = Untracked files (These are vector databasese)
+# Vector databases should not be tracked (Embeddings + Index files + Metadata + Binary Storage)
+## Reason: Large, Regeneratable, Machine-specific, May expose API/embedding configs
 git add .
 git commit -m "Upload complete folder"
 git push
 
+# Sync with Windows
+rsync -av ~/AI /mnt/c/Users/grove/OneDrive/Desktop/Papa/Outskill_AIGF_Engineering_Material/
+
+# Always add vector database to gitignore after generating new vector databases
