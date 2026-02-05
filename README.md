@@ -15,6 +15,8 @@ AI/
 ├── requirements.txt # Python dependencies
 ├── README.md
 
+# On terminal
+![alt text](image-1.png)
 
 # CTRL (Strg) + SHIFT Button above Strg + E 
 Exit extension viewClose specfic extensions
@@ -32,8 +34,14 @@ python3 --version
 ---
 
 ### 2️⃣ Create Virtual Environment
+conda deactivate 
+This removes base
 source .venv/bin/activate
+pip freeze 
+gives you list of installed packages
 
+pip freeze > requirements-lock.txt
+# For reproducibility
 
 ---
 
@@ -158,3 +166,31 @@ git push
 rsync -av ~/AI /mnt/c/Users/grove/OneDrive/Desktop/Papa/Outskill_AIGF_Engineering_Material/
 
 # Always add vector database to gitignore after generating new vector databases
+
+RAG Application Dependency Tree
+├── numpy (base)
+├── pandas (base)
+├── scikit-learn (metrics)
+├── python-dotenv (config)
+├── LangChain Stack
+│   ├── langchain (core framework)
+│   ├── langchain-core (abstractions)
+│   ├── langchain-community (integrations)
+│   ├── langchain-text-splitters (chunking)
+│   ├── langchain-openai (GPT models)
+│   ├── langchain-huggingface (embeddings)
+│   └── langchain-chroma (vector store)
+├── Embeddings
+│   ├── transformers (models)
+│   └── sentence-transformers (sentence embeddings)
+└── Vector Database
+    ├── chromadb (storage)
+    └── pysqlite3 (Colab fix)
+
+    # https://claude.ai/chat/a70e64d7-089a-49ad-8ada-0b26341e7eb1#python-standard-library
+
+
+
+    cp "/mnt/c/Users/grove/Downloads/Packages_Methods.md" ~/AI/
+    cp "/mnt/c/Users/grove/Downloads/Installation_guide.md" ~/AI/
+g
