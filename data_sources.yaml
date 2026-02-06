@@ -1,0 +1,34 @@
+sources:
+  # ✅ TXT corpus (auto-discover all .txt)
+  - id: corpus_txt
+    type: folder
+    format: txt
+    path: data/corpus/txt
+    glob: "**/*.txt"
+    title: "TXT corpus"
+    tags: ["txt"]
+
+  # ✅ PDFs corpus (auto-discover all .pdf)
+  - id: corpus_pdf
+    type: folder
+    format: pdf
+    path: data/corpus/papers
+    glob: "**/*.pdf"
+    title: "PDF corpus"
+    tags: ["pdf"]
+
+  # ✅ DOCX corpus (auto-discover all .docx)
+  - id: corpus_docx
+    type: folder
+    format: docx
+    path: data/corpus/docs
+    glob: "**/*.docx"
+    title: "DOCX corpus"
+    tags: ["docx"]
+
+  # ✅ Example URL source (keep URL entries explicit)
+  - id: dspy_rag_tutorial
+    type: url
+    url: https://dspy.ai/tutorials/rag/
+    title: "DSPy RAG Tutorial"
+    tags: ["url"]
