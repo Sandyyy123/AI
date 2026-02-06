@@ -193,4 +193,39 @@ RAG Application Dependency Tree
 
     cp "/mnt/c/Users/grove/Downloads/Packages_Methods.md" ~/AI/
     cp "/mnt/c/Users/grove/Downloads/Installation_guide.md" ~/AI/
-g
+
+
+project/
+├─ data_sources.yaml
+├─ src/
+│  ├─ rag/
+│  │  ├─ pipeline.py          # orchestrates phases
+│  │  ├─ models.py            # Document, Chunk, SourceSpec
+│  │  ├─ registry.py          # maps type -> loader
+│  │  ├─ normalize.py         # normalize_text, clean_html, etc.
+│  │  ├─ chunkers/
+│  │  │  ├─ base.py
+│  │  │  ├─ recursive.py
+│  │  │  ├─ token.py
+│  │  │  ├─ sentence.py
+│  │  │  ├─ paragraph.py
+│  │  │  └─ headers.py
+│  │  └─ loaders/
+│  │     ├─ base.py
+│  │     ├─ file_text.py      # txt/md
+│  │     ├─ pdf.py            # pdf -> text
+│  │     ├─ docx.py           # docx -> text
+│  │     ├─ html_url.py       # url -> html -> main content
+│  │     ├─ csv.py            # csv -> text rows
+│  │     ├─ json.py           # json -> flattened text
+│  │     └─ folder.py         # folder glob expansion into many SourceSpec
+├─ scripts/
+│  ├─ phase_a_run.py          # CLI runner calling pipeline
+└─ outputs/
+
+
+![alt text](image-6.png)
+![alt text](image-5.png)
+![alt text](image-4.png)
+![alt text](image-3.png)
+![](image-2.png)
