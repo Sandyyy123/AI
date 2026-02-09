@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""
+Phase B (Unified): Embed chunks JSONL -> Chroma (local or remote)
+
+Embedders supported:
+  openai      : OpenAI embeddings via openai SDK
+  xai         : xAI (Grok) via OpenAI-compatible endpoint (openai SDK + base_url)
+  gemini      : Google Gemini embeddings via REST (batchEmbedContents)
+  local_hf    : Hugging Face/SentenceTransformers local models
+  ollama      : Ollama local embeddings via REST (/api/embeddings)
+  litellm     : LiteLLM embeddings wrapper (many providers)
+  voyage      : Voyage embeddings (common choice when you want Claude for generation)
+
+Vector store modes:
+  chroma_local: chromadb.PersistentClient(path=...)
+  chroma_http : chromadb.HttpClient(host=..., port=...)
+
+Input JSONL format (one chunk per line):
+  {"doc_id": "...", "chunk_id": "...", "text": "...", "meta": {...}}
+
+Output:
+  Chroma collection with explicit embeddings stored (embeddings=... in upsert)
+"""
+
+# ---- SQLITE PATCH (must be first) ----
+import sys
+import pysqlite3
+sys.modules["sqlite3"] = pysqlite3
+# --------------------------------------
+
+# ---- LOAD .env EARLY ----
+from dotenv import load_dotenv
+load_dotenv()  # loads .env from project root (current working directory)
+# -------------------------
+
+import argparse
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import chromadb
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"[JSONL ERROR] {path}:{i}: {e}")
+    return rows
+
+
+def batched(seq: List[Any], batch_size: int) -> List[List[Any]]:
+    return [seq[i : i + batch_size] for i in range(0, len(seq), batch_size)]
+
+
+def model_slug(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")[:80]
+
+
+defsafe_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+"""
+    Chroma metadata values must be: str/int/float/bool/None (no lists/dicts).
+    We coerce:
+      - list/tuple/set -> JSON string
+      - dict -> JSON string
+    """
+    out: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, (list, tuple, set, dict)):
+            out[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[k] = str(v)
+    return out
+
+
+# -----------------------------
+# Embedders
+# -----------------------------
+def embed_openai(texts: List[str], model: str) -> List[List[float]]:
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise SystemExit("Missing OPENAI_API_KEY")
+
+    client = OpenAI(api_key=api_key)
+    resp = client.embeddings.create(model=model, input=texts)
+    return [d.embedding for d in resp.data]
+
+
+def embed_xai(texts: List[str], model: str, base_url: str) -> List[List[float]]:
+    """
+    xAI uses an OpenAI-compatible API surface. We use OpenAI SDK with base_url.
+    """
+    from openai import OpenAI
+
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise SystemExit("Missing XAI_API_KEY")
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    resp = client.embeddings.create(model=model, input=texts)
+    return [d.embedding for d in resp.data]
+
+
+def embed_gemini_batch(texts: List[str], model: str, task_type: Optional[str]) -> List[List[float]]:
+    """
+    Gemini embeddings via REST:
+      POST https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents
+      header: x-goog-api-key: GEMINI_API_KEY
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise SystemExit("Missing GEMINI_API_KEY")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+    reqs = []
+    for t in texts:
+        r: Dict[str, Any] = {"content": {"parts": [{"text": t}]}}
+        if task_type:
+            r["taskType"] = task_type  # e.g. RETRIEVAL_DOCUMENT
+        reqs.append(r)
+
+    payload = {"requests": reqs}
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise SystemExit(f"[GEMINI ERROR] {resp.status_code}: {resp.text[:800]}")
+
+    data = resp.json()
+    embeddings = data.get("embeddings")
+    if not embeddings:
+        raise SystemExit(f"[GEMINI ERROR] Unexpected response keys: {list(data.keys())}")
+
+    out: List[List[float]] = []
+    for e in embeddings:
+        vals = e.get("values")
+        if not vals:
+            raise SystemExit("[GEMINI ERROR] Missing embedding values")
+        out.append(vals)
+    return out
+
+
+def embed_local_hf(texts: List[str], model: str, device: str, normalize: bool) -> List[List[float]]:
+    from sentence_transformers import SentenceTransformer
+
+    m = SentenceTransformer(model, device=device)
+    vecs = m.encode(
+        texts,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=normalize,
+    )
+    return vecs.tolist()
+
+
+def embed_ollama(texts: List[str], model: str, ollama_url: str) -> List[List[float]]:
+    """
+    Ollama embeddings endpoint:
+      POST {ollama_url}/api/embeddings
+      {"model":"nomic-embed-text", "prompt":"..."}
+    """
+    base = ollama_url.rstrip("/")
+    endpoint = f"{base}/api/embeddings"
+
+    out: List[List[float]] = []
+    for t in texts:
+        r = requests.post(endpoint, json={"model": model, "prompt": t}, timeout=60)
+        if r.status_code != 200:
+            raise SystemExit(f"[OLLAMA ERROR] {r.status_code}: {r.text[:800]}")
+        data = r.json()
+        emb = data.get("embedding")
+        if not emb:
+            raise SystemExit("[OLLAMA ERROR] Missing 'embedding' in response")
+        out.append(emb)
+    return out
+
+
+def embed_litellm(texts: List[str], model: str) -> List[List[float]]:
+    """
+    LiteLLM embeddings wrapper. Model strings vary, e.g.:
+      openai/text-embedding-3-small
+      ollama/nomic-embed-text
+      azure/<deployment>
+      openai-compatible endpoints if configured in LiteLLM env
+    """
+    try:
+        from litellm import embedding
+    except Exception as e:
+        raise SystemExit(f"LiteLLM not installed/importable: {type(e).__name__}: {e}")
+
+    # LiteLLM returns: {"data":[{"embedding":[...]}...]}
+    resp = embedding(model=model, input=texts)
+    data = resp.get("data", [])
+    if not data:
+        raise SystemExit("[LITELLM ERROR] No data returned from embeddings call")
+    return [row["embedding"] for row in data]
+
+
+def embed_voyage(texts: List[str], model: str, input_type: str) -> List[List[float]]:
+    """
+    Voyage embeddings (useful when you want Claude for generation).
+    Voyage client reads VOYAGE_API_KEY env var.
+    """
+    try:
+        import voyageai
+    except Exception as e:
+        raise SystemExit(f"voyageai not installed/importable: {type(e).__name__}: {e}")
+
+    vo = voyageai.Client()
+    res = vo.embed(texts, model=model, input_type=input_type)
+    return res.embeddings
+
+
+def get_embeddings(
+    embedder: str,
+    texts: List[str],
+    model: str,
+    device: str,
+    normalize: bool,
+    gemini_task_type: Optional[str],
+    ollama_url: str,
+    voyage_input_type: str,
+) -> List[List[float]]:
+    if embedder == "openai":
+        return embed_openai(texts, model=model)
+
+    if embedder == "xai":
+        base_url = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")
+        return embed_xai(texts, model=model, base_url=base_url)
+
+    if embedder == "gemini":
+        return embed_gemini_batch(texts, model=model, task_type=gemini_task_type)
+
+    if embedder == "local_hf":
+        return embed_local_hf(texts, model=model, device=device, normalize=normalize)
+
+    if embedder == "ollama":
+        return embed_ollama(texts, model=model, ollama_url=ollama_url)
+
+    if embedder == "litellm":
+        return embed_litellm(texts, model=model)
+
+    if embedder == "voyage":
+        return embed_voyage(texts, model=model, input_type=voyage_input_type)
+
+    raise SystemExit(f"Unknown embedder: {embedder}")
+
+
+# -----------------------------
+# Chroma client factory
+# -----------------------------
+def get_chroma_collection(
+    mode: str,
+    persist: Optional[str],
+    host: Optional[str],
+    port: Optional[int],
+    collection: str,
+    metadata: Dict[str, Any],
+):
+    if mode == "local":
+        if not persist:
+            raise SystemExit("chroma_mode=local requires --persist")
+        Path(persist).mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=persist)
+        col = client.get_or_create_collection(name=collection, metadata=metadata)
+        return client, col
+
+    if mode == "http":
+        if not host or not port:
+            raise SystemExit("chroma_mode=http requires --chroma_host and --chroma_port")
+        client = chromadb.HttpClient(host=host, port=port)
+        col = client.get_or_create_collection(name=collection, metadata=metadata)
+        return client, col
+
+    raise SystemExit(f"Unknown chroma_mode: {mode}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    p = argparse.ArgumentParser(description="Phase B: Embed chunks JSONL -> Chroma (OpenAI/Gemini/xAI/HF/Ollama/LiteLLM/Voyage)")
+
+    p.add_argument("--input", required=True, help="chunks JSONL, e.g. outputs/chunks_all_recursive.jsonl")
+
+    # Chroma settings
+    p.add_argument("--chroma_mode", choices=["local", "http"], default="local")
+    p.add_argument("--persist", default=None, help="local only: persist directory (e.g. chroma_db_recursive_openai)")
+    p.add_argument("--chroma_host", default=None, help="http only: Chroma host")
+    p.add_argument("--chroma_port", type=int, default=None, help="http only: Chroma port")
+    p.add_argument("--collection", required=True, help="Chroma collection name")
+
+    # Embedder settings
+    p.add_argument("--embedder", required=True, choices=["openai", "gemini", "xai", "local_hf", "ollama", "litellm", "voyage"])
+    p.add_argument("--model", required=True, help="Embedding model name for the chosen provider")
+
+    # Embedder options
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--sleep", type=float, default=0.0, help="Pause between batches (rate limits)")
+
+    # local_hf options
+    p.add_argument("--device", default="cpu", help="local_hf: cpu|cuda")
+    p.add_argument("--normalize", action="store_true", help="local_hf: normalize embeddings (often good for cosine)")
+
+    # gemini options
+    p.add_argument("--gemini_task_type", default=None, help="gemini: e.g. RETRIEVAL_DOCUMENT")
+
+    # ollama options
+    p.add_argument("--ollama_url", default="http://localhost:11434", help="ollama base URL (default: http://localhost:11434)")
+
+    # voyage options
+    p.add_argument("--voyage_input_type", default="document", help="voyage: document|query")
+
+    args = p.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise SystemExit(f"Input not found: {input_path}")
+
+    rows = load_jsonl(input_path)
+    if not rows:
+        raise SystemExit("No chunks found in input JSONL.")
+
+    ids: List[str] = []
+    docs: List[str] = []
+    metas: List[Dict[str, Any]] = []
+
+    for r in rows:
+        cid = r.get("chunk_id")
+        txt = r.get("text")
+        meta = r.get("meta", {})
+
+        if not cid or not isinstance(cid, str):
+            raise SystemExit("Bad row: missing/invalid chunk_id")
+        if not txt or not isinstance(txt, str):
+            raise SystemExit(f"Bad row: chunk {cid} missing/invalid text")
+
+        ids.append(cid)
+        docs.append(txt)
+        metas.append(safe_meta(meta))
+
+    # Create Chroma collection
+    coll_meta = {
+        "embedder": args.embedder,
+        "model": args.model,
+        "model_slug": model_slug(args.model),
+        "source_chunks": str(input_path),
+    }
+    client, col = get_chroma_collection(
+        mode=args.chroma_mode,
+        persist=args.persist,
+        host=args.chroma_host,
+        port=args.chroma_port,
+        collection=args.collection,
+        metadata=coll_meta,
+    )
+
+    total = len(ids)
+    print(f"Embedding {total} chunks")
+    print(f"Embedder: {args.embedder}")
+    print(f"Model:    {args.model}")
+    print(f"Chroma:   mode={args.chroma_mode} collection={args.collection}")
+    if args.chroma_mode == "local":
+        print(f"Persist:  {args.persist}")
+    else:
+        print(f"HTTP:     {args.chroma_host}:{args.chroma_port}")
+
+    # Embed + upsert
+    id_batches = batched(ids, args.batch_size)
+    doc_batches = batched(docs, args.batch_size)
+    meta_batches = batched(metas, args.batch_size)
+
+    for bi, (id_b, doc_b, meta_b) in enumerate(zip(id_batches, doc_batches, meta_batches), start=1):
+        vecs = get_embeddings(
+            embedder=args.embedder,
+            texts=doc_b,
+            model=args.model,
+            device=args.device,
+            normalize=args.normalize,
+            gemini_task_type=args.gemini_task_type,
+            ollama_url=args.ollama_url,
+            voyage_input_type=args.voyage_input_type,
+        )
+
+        if len(vecs) != len(id_b):
+            raise SystemExit("Embedding count mismatch with batch size")
+
+        col.upsert(ids=id_b, documents=doc_b, metadatas=meta_b, embeddings=vecs)
+
+        done = min(bi * args.batch_size, total)
+        print(f"  upserted {done}/{total}")
+
+        if args.sleep > 0:
+            time.sleep(args.sleep)
+
+    # Persist best-effort
+    try:
+        client.persist()
+    except Exception:
+        pass
+
+    print(f"✅ Done. Collection count = {col.count()}")
+
+
+if __name__ == "__main__":
+    main()
