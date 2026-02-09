@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+Phase A: YAML-driven ingestion -> cleaning -> chunking -> JSONL outputs.
+
+What this version adds (Option 1):
+✅ type: folder expansion (glob -> many file sources)
+✅ real PDF extraction (pypdf)
+✅ real DOCX extraction (python-docx)
+
+You can now add PDFs/DOCX as folder entries in data_sources.yaml and run downstream.
+"""
+
+import argparse
+import json
+import re
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
+
+
+# -----------------------------
+# Data models
+# -----------------------------
+@dataclass
+class Document:
+    id: str
+    title: str
+    source_type: str   # file/url
+    source: str        # abs path or url
+    text: str
+    meta: Dict[str, Any]
+
+
+@dataclass
+class Chunk:
+    doc_id: str
+    chunk_id: str
+    text: str
+    meta: Dict[str, Any]
+
+
+# -----------------------------
+# Cleaning
+# -----------------------------
+def normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = text.replace("\t", " ")
+    text = re.sub(r"[^\S\n]+", " ", text)
+
+    lines = [ln.strip() for ln in text.split("\n")]
+    out: List[str] = []
+    blank = 0
+    for ln in lines:
+        if ln == "":
+            blank += 1
+            if blank <= 1:
+                out.append("")
+        else:
+            blank = 0
+            out.append(ln)
+
+    return "\n".join(out).strip()
+
+
+# -----------------------------
+# Folder expansion
+# -----------------------------
+def slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")
+
+
+def expand_folder_sources(project_root: Path, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Converts YAML entries like:
+      - type: folder, path: ..., glob: "**/*.pdf", format: pdf
+    into MANY entries of:
+      - type: file, path: <each matched file>, format: pdf
+    """
+    expanded: List[Dict[str, Any]] = []
+
+    for s in sources:
+        stype = s.get("type")
+        if stype != "folder":
+            expanded.append(s)
+            continue
+
+        folder_path = s.get("path")
+        pattern = s.get("glob")
+        fmt = s.get("format")
+
+        if not folder_path or not pattern:
+            raise SystemExit(f"Folder source '{s.get('id')}' must include 'path' and 'glob'.")
+
+        folder_abs = (project_root / folder_path).resolve()
+        if not folder_abs.exists():
+            raise SystemExit(f"Folder path does not exist: {folder_abs}")
+
+        matches = sorted(folder_abs.glob(pattern))
+        if not matches:
+            print(f"⚠️ No files matched for folder source '{s.get('id')}' at {folder_abs} with glob '{pattern}'")
+
+        base_id = s.get("id", "folder")
+        base_title = s.get("title", base_id)
+        tags = s.get("tags", [])
+        loader_options = s.get("loader_options", {})
+        meta_extra = {k: v for k, v in s.items() if k not in {"type", "path", "glob", "format"}}
+
+        for fp in matches:
+            if fp.is_dir():
+                continue
+
+            # Build a stable derived id: baseid__filename
+            derived = f"{base_id}__{slugify(fp.stem)}"
+
+            expanded.append({
+                "id": derived,
+                "type": "file",
+                "format": fmt,  # pdf/docx/txt...
+                "path": str(fp.relative_to(project_root)),  # keep YAML-style relative path
+                "title": f"{base_title}: {fp.name}",
+                "tags": tags,
+                "loader_options": loader_options,
+                **meta_extra,
+            })
+
+    return expanded
+
+
+# -----------------------------
+# File loaders by format
+# -----------------------------
+def load_txt_like(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def load_pdf(path: Path) -> str:
+    """
+    Real PDF text extraction.
+    Uses pypdf (pip install pypdf).
+    """
+    from pypdf import PdfReader  # type: ignore
+    reader = PdfReader(str(path))
+    parts: List[str] = []
+    for i, page in enumerate(reader.pages, start=1):
+        txt = page.extract_text() or ""
+        txt = txt.strip()
+        if txt:
+            parts.append(f"[PAGE {i}]\n{txt}")
+    return "\n\n".join(parts)
+
+
+def load_docx(path: Path) -> str:
+    """
+    Real DOCX text extraction.
+    Uses python-docx (already installed).
+    """
+    from docx import Document as DocxDocument  # type: ignore
+    doc = DocxDocument(str(path))
+    paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    return "\n".join(paras)
+
+
+def load_file_by_format(project_root: Path, rel_path: str, fmt: str) -> Tuple[str, str]:
+    p = (project_root / rel_path).resolve()
+    if not p.exists():
+        raise SystemExit(f"File not found: {p}")
+
+    fmt = (fmt or "").lower()
+
+    if fmt in {"txt", "md"}:
+        raw = load_txt_like(p)
+    elif fmt == "pdf":
+        raw = load_pdf(p)
+    elif fmt == "docx":
+        raw = load_docx(p)
+    else:
+        raise SystemExit(f"Unsupported file format '{fmt}' for file: {p.name}")
+
+    return raw, str(p)
+
+
+def load_url(url: str, timeout: int = 30) -> Tuple[str, str]:
+    import requests
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.text, url
+
+
+# -----------------------------
+# Chunkers (keep simple for Phase A; you can expand)
+# -----------------------------
+def chunk_char_window(text: str, chunk_size: int, overlap: int) -> List[str]:
+    if chunk_size <= 0:
+        return [text]
+    out: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = min(n, i + chunk_size)
+        out.append(text[i:j])
+        if j == n:
+            break
+        i = max(0, j - overlap)
+    return out
+
+
+def chunk_recursive_langchain(text: str, chunk_size: int, overlap: int) -> Tuple[List[str], str]:
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        return splitter.split_text(text), "used_langchain_recursive"
+    except Exception as e:
+        return chunk_char_window(text, chunk_size, overlap), f"fallback_char_window:{type(e).__name__}"
+
+
+# -----------------------------
+# Selection helper
+# -----------------------------
+def select_sources(sources: List[Dict[str, Any]], ids: Optional[List[str]], exclude: Optional[List[str]]) -> List[Dict[str, Any]]:
+    wanted = set(ids) if ids else None
+    excluded = set(exclude) if exclude else set()
+
+    selected: List[Dict[str, Any]] = []
+    for s in sources:
+        sid = s.get("id")
+        if not sid:
+            raise SystemExit("A source is missing required field: id")
+        if wanted is not None and sid not in wanted:
+            continue
+        if sid in excluded:
+            continue
+        selected.append(s)
+    return selected
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Phase A: load(any filetype via YAML) -> clean -> chunk -> JSONL")
+    parser.add_argument("--ids", nargs="*", default=None, help="Process only these IDs")
+    parser.add_argument("--exclude", nargs="*", default=None, help="Exclude these IDs")
+    parser.add_argument("--strategy", choices=["char", "recursive"], default="recursive", help="Chunk strategy (Phase A)")
+    parser.add_argument("--chunk_size", type=int, default=1200, help="Chunk size (chars)")
+    parser.add_argument("--overlap", type=int, default=200, help="Overlap (chars)")
+    parser.add_argument("--timeout", type=int, default=30, help="URL timeout (sec)")
+    parser.add_argument("--out_dir", type=str, default="outputs", help="Outputs folder")
+    args = parser.parse_args()
+
+    root = Path(".").resolve()
+    manifest_path = root / "data_sources.yaml"
+    if not manifest_path.exists():
+        raise SystemExit("data_sources.yaml not found in project root.")
+
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    sources = manifest.get("sources", [])
+    if not sources:
+        raise SystemExit("No sources found under 'sources:' in data_sources.yaml")
+
+    # ✅ expand folder entries into file entries BEFORE selection
+    sources = expand_folder_sources(root, sources)
+
+    # apply selection
+    selected = select_sources(sources, args.ids, args.exclude)
+    if not selected:
+        available = [s.get("id") for s in sources]
+        raise SystemExit(f"No sources selected. Available IDs: {available}")
+
+    out_dir = (root / args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    label = "all" if not args.ids else "_".join(sorted(args.ids))
+    out_docs = out_dir / f"documents_{label}.jsonl"
+    out_chunks = out_dir / f"chunks_{label}_{args.strategy}.jsonl"
+
+    # Load + normalize documents
+    documents: List[Document] = []
+
+    for s in selected:
+        sid = s["id"]
+        stype = s.get("type")
+        title = s.get("title", sid)
+        tags = s.get("tags", [])
+        fmt = s.get("format")
+
+        meta = {k: v for k, v in s.items() if k not in {"path", "url", "type"}}
+        meta["title"] = title
+        meta["tags"] = tags
+
+        if stype == "file":
+            if "path" not in s or not fmt:
+                raise SystemExit(f"File source '{sid}' must include 'path' and 'format'.")
+            raw, src = load_file_by_format(root, s["path"], fmt)
+
+        elif stype == "url":
+            if "url" not in s:
+                raise SystemExit(f"URL source '{sid}' missing 'url'.")
+            raw, src = load_url(s["url"], timeout=args.timeout)
+
+        else:
+            raise SystemExit(f"Unsupported type '{stype}' for source '{sid}' (use file/url/folder).")
+
+        text = normalize_text(raw)
+
+        documents.append(Document(
+            id=sid,
+            title=title,
+            source_type=stype,
+            source=src,
+            text=text,
+            meta=meta
+        ))
+
+    # Write documents JSONL
+    with out_docs.open("w", encoding="utf-8") as f:
+        for d in documents:
+            f.write(json.dumps(asdict(d), ensure_ascii=False) + "\n")
+
+    # Chunk and write chunks JSONL
+    with out_chunks.open("w", encoding="utf-8") as f:
+        for d in documents:
+            if args.strategy == "char":
+                parts = chunk_char_window(d.text, args.chunk_size, args.overlap)
+                strategy_note = "char_window"
+            else:
+                parts, strategy_note = chunk_recursive_langchain(d.text, args.chunk_size, args.overlap)
+
+            for i, txt in enumerate(parts, start=1):
+                txt = normalize_text(txt)
+                if not txt:
+                    continue
+
+                chunk_id = f"{d.id}::c{i:04d}"
+                meta = {
+                    **d.meta,
+                    "source_type": d.source_type,
+                    "source": d.source,
+                    "chunk_index": i,
+                    "n_chars": len(txt),
+                    "strategy": args.strategy,
+                    "strategy_note": strategy_note,
+                    "chunk_size": args.chunk_size,
+                    "overlap": args.overlap,
+                }
+                f.write(json.dumps(asdict(Chunk(doc_id=d.id, chunk_id=chunk_id, text=txt, meta=meta)), ensure_ascii=False) + "\n")
+
+    print("✅ Selected IDs:", [s["id"] for s in selected])
+    print("✅ Wrote:")
+    print(" -", out_docs)
+    print(" -", out_chunks)
+    print("✅ Folder sources were expanded BEFORE selection (PDF/DOCX now supported).")
+
+
+if __name__ == "__main__":
+    main()

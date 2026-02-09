@@ -32,3 +32,38 @@ sources:
     url: https://dspy.ai/tutorials/rag/
     title: "DSPy RAG Tutorial"
     tags: ["url"]
+
+ # ♨️ NEW: Markdown corpus
+  - id: documentation_markdown
+    type: folder
+    format: md
+    path: data/corpus/markdown # Example path
+    glob: "**/*.md"
+    title: "Project Documentation"
+    tags: ["markdown", "docs"]
+
+ # ♨️ HTML pages from a local directory
+  - id: web_archive_html
+    type: folder
+    format: html
+    path: data/corpus/html_archive # Example path
+    glob: "**/*.html"
+    title: "Archived Web Content"
+    tags: ["html", "web"]
+
+  # ♨️ Example URL for robust HTML parsing
+  - id: example_blog_post
+    type: url
+    url: https://towardsdatascience.com/what-i-am-doing-to-stay-relevant-as-a-senior-analytics-consultant-in-2026/
+    title: "Senior Analytics Consultant in 2026"
+    tags: ["blog", "html", "url"]
+
+  # ♨️ Mixed folder with implied format from extension
+  - id: mixed_docs_folder
+    type: folder
+    format: auto           # Let script infer format from file extension
+    path: data/corpus/mixed # Folder containing .txt, .pdf, .docx, .html
+    glob: "**/*.*"         # Matches all files
+    # No 'format' specified, script will infer from extension
+    title: "Mixed Document Repository"
+    tags: ["mixed", "various"]
