@@ -7,3 +7,39 @@ rag:
   chunk_size: 500
   chunk_overlap: 50
   embedding_model: text-embedding-3-small
+
+  # New chunking configuration
+  chunking:
+    # Default strategy
+    strategy: recursive_character
+
+    # Configuration for RecursiveCharacterTextSplitter
+    recursive_character:
+      # Default separators
+      separators: ["\n\n", "\n", " ", ""]
+      # Whether to keep separator in chunk
+      keep_separator: false
+      # Function to measure chunk length (e.g., len for characters)
+      length_function: "len"
+      # optional overrides:
+      # chunk_size: 500
+      # chunk_overlap: 50
+
+
+    # Configuration for SentenceTextSplitter (or NLTK-based)
+    sentence:
+      keep_separator: false
+
+    # Configuration for MarkdownHeaderTextSplitter
+    markdown_header:
+      headers_to_split_on:
+        - {_level: 1, name: h1 }
+        - {_level: 2, name: h2 }
+        - {_level: 3, name: h3 }
+      keep_separator: false
+
+    # Configuration for HTMLSectionSplitter
+    html_section:
+      # Example tags – customize as needed for HTML sources
+      tags_to_split_on: ["h1", "h2", "h3", "p", "div", "pre", "li", "ul"]
+      keep_separator: false
