@@ -7,6 +7,13 @@ sources:
     glob: "**/*.txt"
     title: "TXT corpus"
     tags: ["txt"]
+     # Example of overriding chunking for this source
+    # chunking:
+    #   strategy: recursive_character
+    #   recursive_character:
+    #     separators: ["\n\n", "\n", ".", "?", "!", "\n", " ", ""]
+    #     chunk_size: 1000
+    #     chunk_overlap: 100
 
   # ✅ PDFs corpus (auto-discover all .pdf)
   - id: corpus_pdf
@@ -16,6 +23,13 @@ sources:
     glob: "**/*.pdf"
     title: "PDF corpus"
     tags: ["pdf"]
+     # Example: You might want sentence chunking for PDFs
+    # chunking:
+    #   strategy: sentence
+    #   sentence:
+    #     keep_separator: true
+    #     chunk_size: 200 # Smaller chunks for dense PDF text
+    #     chunk_overlap: 20
 
   # ✅ DOCX corpus (auto-discover all .docx)
   - id: corpus_docx
@@ -32,6 +46,13 @@ sources:
     url: https://dspy.ai/tutorials/rag/
     title: "DSPy RAG Tutorial"
     tags: ["url"]
+    # For a URL, if you expect HTML content, HTMLSectionChunking is a good choice
+    # chunking:
+    #   strategy: html_section
+    #   html_section:
+    #     tags_to_split_on: ["h1", "h2", "h3", "p", "li"]
+    #     keep_separator: false
+
 
  # ♨️ NEW: Markdown corpus
   - id: documentation_markdown
@@ -41,6 +62,18 @@ sources:
     glob: "**/*.md"
     title: "Project Documentation"
     tags: ["markdown", "docs"]
+     # Override default chunking for this source to use Markdown header splitting
+    chunking:
+      strategy: markdown_header
+      markdown_header:
+        headers_to_split_on:
+          - {"_level": 1, "name": "h1"} # Markdown uses # for H1
+          - {"_level": 2, "name": "h2"} # Markdown uses ## for H2
+          - {"_level": 3, "name": "h3"} # Markdown uses ### for H3
+        keep_separator: True
+        # keep_separator is less relevant for MarkdownHeaderTextSplitter as it adds header to metadata
+        # chunk_size and chunk_overlap are advisory for structural splitters
+       
 
  # ♨️ HTML pages from a local directory
   - id: web_archive_html
@@ -50,13 +83,26 @@ sources:
     glob: "**/*.html"
     title: "Archived Web Content"
     tags: ["html", "web"]
+     # Override for HTML section splitting
+    chunking:
+      strategy: html_section
+      html_section:
+        tags_to_split_on: ["h1", "h2", "h3", "p", "div", "li"]
+        keep_separator: false
+        # chunk_size and chunk_overlap are advisory for structural splitters
+
 
   # ♨️ Example URL for robust HTML parsing
   - id: example_blog_post
     type: url
-    url: https://towardsdatascience.com/what-i-am-doing-to-stay-relevant-as-a-senior-analytics-consultant-in-2026/
-    title: "Senior Analytics Consultant in 2026"
+    url: https://beautiful-soup-4.readthedocs.io/en/latest/
+    title: "Beautiful Soup Documentation"
     tags: ["blog", "html", "url"]
+    # For a specialized blog post, you might use recursive or sentence (or HTML)
+    # chunking:
+    #   strategy: recursive_character
+    #   recursive_character:
+    #     separators: ["\n\n", "\n", " ", ""]
 
   # ♨️ Mixed folder with implied format from extension
   - id: mixed_docs_folder
@@ -67,3 +113,18 @@ sources:
     # No 'format' specified, script will infer from extension
     title: "Mixed Document Repository"
     tags: ["mixed", "various"]
+    # For mixed documents, you might rely on the auto-detection to then apply
+    # a default strategy, or apply a generic one like recursive_character.
+    # If the documents within are known to have structure (e.g., all HTML articles),
+    # you could specify a structural chunker here, but `auto` format means
+    # the format-specific chunker (like html_section for a .html file) might be better
+    # determined dynamically in phase_a_build_chunks.
+
+  ✅ Structured datasets (CSV/TSV/Excel)
+  - id: structured_data
+    type: folder
+    format: auto
+    path: data/corpus/structured
+    glob: "**/*.*"
+    title: "Structured datasets"
+    tags: ["structured", "csv", "tsv", "excel"]

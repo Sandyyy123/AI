@@ -774,10 +774,3 @@ It saves:
 ✔ Exact versions
 ✔ All dependencies
 ✔ Fully reproducible environment
-
-ollama pull nomic-embed-text
-python -m pip install voyageai
-(voyageai for claude)
-
-# Replacement sqlite
-pip install pysqlite3-binary
