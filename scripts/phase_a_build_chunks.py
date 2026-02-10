@@ -23,6 +23,7 @@ import json
 import re
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+from time import time
 from typing import Any, Dict, List, Optional, Tuple, Callable, Type # Added Type for type hinting chunker class
 import hashlib
 
@@ -31,6 +32,7 @@ import warnings
 import logging
 import os
 import sys
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,10 +57,11 @@ try:
         MarkdownHeaderChunking,
         HTMLSectionChunking,
         PropositionChunking, # <<< Added PropositionChunking import
+        ParentDocumentChunking # <<< Added ParentDocumentChunking import
     )
 except ImportError as e:
-    logger.error(f"Error importing chunking components from src.rag.components.chunkers: {e}. "
-                 "Ensure src/rag/components/chunkers.py is correctly set up and dependencies are met.")
+    logger.error(f"Error importing chunking components from scripts.rag.components.chunkers: {e}. "
+                 "Ensure scripts/rag/components/chunkers.py is correctly set up and dependencies are met.")
     # Set fallbacks so the script can still run in a degraded mode if necessary
     Chunk = None
     CHUNK_STRATEGY_REGISTRY = {}
@@ -68,6 +71,7 @@ except ImportError as e:
     MarkdownHeaderChunking = None
     HTMLSectionChunking = None
     PropositionChunking = None
+    ParentDocumentChunking = None 
 
 # --- Rest of the imports remain the same ---
 # PDF
@@ -137,6 +141,14 @@ except Exception:
     sentence_tokenizer = lambda text: text.split(". ") # Basic fallback
     logger.warning("NLTK not available or punkt missing. Sentence operations will be basic.")
 
+# -----------------------------
+# Helpers 
+# -----------------------------
+def get_config_hash(config_dict: Dict[str, Any]) -> str:
+    """Generates a stable hash for a configuration dictionary."""
+    # Convert dict to a sorted JSON string for consistent hashing
+    sorted_json = json.dumps(config_dict, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(sorted_json.encode('utf-8')).hexdigest()
 
 # --- Data Models ---
 # This Document dataclass remains local to phase_a_build_chunks for ingestion processing
@@ -254,7 +266,7 @@ def expand_folder_sources(project_root: Path, sources: List[Dict[str, Any]]) -> 
 
         folder_path = s.get("path")
         pattern = s.get("glob")
-        fmt = s.get("format") # 'pdf', 'docx', 'txt', 'auto', etc.
+        fmt = s.get("format") # 'pdf', 'docx', 'txt', 'auto', None etc.
 
         if not folder_path or not pattern:
             logger.error(f"Folder source '{s.get('id','N/A')}' must include 'path' and 'glob'. Skipping.")
@@ -285,7 +297,7 @@ def expand_folder_sources(project_root: Path, sources: List[Dict[str, Any]]) -> 
 
             # Determine format if 'auto'
             file_fmt = fmt
-            if fmt == "auto":
+            if fmt == ["auto", None]:
                 suffix = fp.suffix.lstrip(".").lower()
                 if suffix in ["txt", "pdf", "docx", "md", "html", "csv", "tsv", "xls", "xlsx"]:
                     file_fmt = suffix
@@ -592,12 +604,33 @@ def select_sources(sources: List[Dict[str, Any]], ids: Optional[List[str]], excl
         selected.append(s)
     return selected
 
+# --- Main Manifest Management (NEW) ---
+MANIFEST_FILE_NAME = "phase_a_manifest.json"
+
+def load_manifest(manifest_path: Path) -> Dict[str, Any]:
+    """Loads the processing manifest."""
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError as e:
+                logger.error(f"Error reading manifest file {manifest_path}: {e}. Starting with empty manifest.")
+                return {}
+    return {}
+
+def save_manifest(manifest_path: Path, manifest_data: Dict[str, Any]):
+    """Saves the processing manifest."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+    logger.info(f"Updated manifest saved to {manifest_path}")
+
+
 # -----------------------------
 # Main
 # -----------------------------
 # In main() before calling load_config
 # scripts/phase_a_build_chunks.py (continued from Step 2)
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -621,39 +654,75 @@ def main():
         default="data_sources.yaml",
         help="Path to the data sources YAML file.",
     )
+    # The default for output-docs/chunks/parents will be dynamically overridden later.
     parser.add_argument(
         "--output-docs",
         type=Path,
-        default="phase_a_processed_docs.jsonl",
-        help="Output path for processed documents (pre-chunking).",
+        default="outputs/phase_a_processed_docs.jsonl", # Base default, overridden dynamically
+        help="Output path for processed documents (pre-chunking)."
     )
     parser.add_argument(
         "--output-chunks",
         type=Path,
-        default="phase_a_processed_chunks.jsonl",
-        help="Output path for processed chunks.",
+        default="outputs/phase_a_processed_chunks.jsonl", # Base default, overridden dynamically
+        help="Output path for processed chunks."
+    )
+    parser.add_argument(
+        "--output-parents",
+        type=Path,
+        default="outputs/phase_a_processed_parents.jsonl", # Base default, overridden dynamically
+        help="Output path for parent documents (larger context units)."
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=60,
-        help="Timeout in seconds for URL requests.",
+        help="Timeout in seconds for URL requests."
     )
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level.",
+        help="Set the logging level."
     )
+    parser.add_argument(
+        "--include-sources",
+        nargs='*',
+        help="List of source IDs from data_sources.yaml to include (space-separated). "
+             "Only these will be processed."
+    )
+    parser.add_argument(
+        "--exclude-sources",
+        nargs='*',
+        help="List of source IDs from data_sources.yaml to exclude (space-separated)."
+    )
+    parser.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help="Force re-processing of all selected sources, even if existing outputs match config."
+    )
+    # Arguments for dynamic output path (these are for naming the output JSONL files distinctly)
+    parser.add_argument(
+        "--output-suffix-chunking-strategy", # Renamed for clarity to avoid confusion with Chroma path
+        type=str,
+        default="default",
+        help="Chunking strategy name to embed in output JSONL filenames (e.g., 'recursive_character')."
+    )
+    parser.add_argument(
+        "--output-suffix-doc-type", # Renamed for clarity
+        type=str,
+        default="docs",
+        help="Document type name to embed in output JSONL filenames (e.g., 'reports', 'manuals')."
+    )
+
     args = parser.parse_args()
 
     logger.setLevel(getattr(logging, args.log_level.upper()))
     
     # --- Load global settings and RAG config ---
-    # Load .env variables
-    settings = load_settings()
+    project_root = args.project_root.resolve()
+    settings = load_settings() # Load environment variables
     
-    # Load main config.yaml
     full_config = load_config(args.config_path)
     rag_config = full_config.get("rag", {})
     global_chunking_config = rag_config.get("chunking", {})
@@ -661,193 +730,403 @@ def main():
     logger.info(f"Loaded RAG configuration: {rag_config}")
     logger.info(f"Global chunking configuration: {global_chunking_config}")
 
-    project_root = args.project_root.resolve()
-    out_docs = project_root / args.output_docs
-    out_chunks = project_root / args.output_chunks
+    # Determine chunking strategy name for output filenames (from CLI then config default)
+    overall_chunking_strategy_name = args.output_suffix_chunking_strategy
+    if overall_chunking_strategy_name == "default" and "chunking" in rag_config:
+        overall_chunking_strategy_name = rag_config["chunking"].get("strategy", "recursive_character")
+    
+    # Generate a hash for the overall RAG pipeline configuration ---
+    # This captures the state of the entire RAG config (including reranker, MQR, distiller settings).
+    # Use full_config.get("rag", {}) because that contains general RAG parameters PLUS
+    # the nested 'reranker', 'query_transformer', 'context_distiller' settings.
+    overall_rag_pipeline_config_hash = get_config_hash(full_config.get("rag", {}))
+    logger.info(f"Overall RAG pipeline config hash: {overall_rag_pipeline_config_hash}")
 
+
+    # --- Dynamic Output Paths Construction (for JSONL files) ---
+    dynamic_suffix_parts = []
+    dynamic_suffix_parts.append(model_slug(overall_chunking_strategy_name))
+    if args.output_suffix_doc_type: # Using output-suffix-doc-type arg
+        dynamic_suffix_parts.append(model_slug(args.output_suffix_doc_type))
+    
+    dynamic_suffix = "_".join(dynamic_suffix_parts) if dynamic_suffix_parts else "default"
+
+    base_output_dir = project_root / "outputs" # Centralized output folder, relative to project_root
+
+    final_output_docs_path = base_output_dir / Path(f"phase_a_processed_docs_{dynamic_suffix}.jsonl")
+    final_output_chunks_path = base_output_dir / Path(f"phase_a_processed_chunks_{dynamic_suffix}.jsonl")
+    final_output_parents_path = base_output_dir / Path(f"phase_a_processed_parents_{dynamic_suffix}.jsonl")
+    
+    base_output_dir.mkdir(parents=True, exist_ok=True) # Ensure outputs directory exists
+    
+    logger.info(f"Output for documents: {final_output_docs_path}")
+    logger.info(f"Output for child chunks: {final_output_chunks_path}")
+    logger.info(f"Output for parent chunks: {final_output_parents_path}")
+    logger.info(f"Sources to include: {args.include_sources or 'All'}")
+    logger.info(f"Sources to exclude: {args.exclude_sources or 'None'}")
+    logger.info(f"Force re-process: {args.force_reprocess}")
+
+    # --- Load data sources and apply initial selection filtering ---
     doc_list_raw: List[Dict[str, Any]] = load_data_sources(args.data_sources_path)
-    logger.info(f"Loaded {len(doc_list_raw)} raw data sources from {args.data_sources_path}")
+    expanded_sources_full = expand_folder_sources(project_root, doc_list_raw)
+    sources_to_process_filtered = select_sources(expanded_sources_full, args.include_sources, args.exclude_sources)
+    logger.info(f"Selected {len(sources_to_process_filtered)} specific document sources for processing.")
 
-    # --- Expand folder sources ---
-    expanded_sources = expand_folder_sources(project_root, doc_list_raw)
-    logger.info(f"Expanded to {len(expanded_sources)} individual file/URL sources.")
+    # Load Manifest (for skipping/reprocessing logic) ---
+    manifest_path = base_output_dir / MANIFEST_FILE_NAME
+    current_manifest = load_manifest(manifest_path)
+    updated_manifest = current_manifest.copy()
 
+    # --- Prepare for comprehensive output information ---
+    summary_output = {
+        "phase": "Phase A: Ingestion & Chunking",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_sources_in_config": len(doc_list_raw),
+        "total_expanded_sources": len(expanded_sources_full),
+        "total_sources_selected_for_processing": len(sources_to_process_filtered),
+        "output_files": {
+            "docs": str(final_output_docs_path.relative_to(project_root)),
+            "chunks": str(final_output_chunks_path.relative_to(project_root)),
+            "parents": str(final_output_parents_path.relative_to(project_root)),
+        },
+        "overall_chunking_strategy_used_for_naming": overall_chunking_strategy_name,
+        "document_type_for_naming": args.output_suffix_doc_type,
+        "rag_pipeline_config_hash_for_run": overall_rag_pipeline_config_hash,
+        "processed_sources_details": [],
+        "total_documents_loaded": 0,
+        "total_chunks_written": 0,
+        "total_parent_chunks_written": 0,
+    }
+
+    
+    # --- Begin processing individual sources ---
     documents: List[Document] = []
     
-    # --- Load and normalize documents ---
-    for s in expanded_sources: # Iterate through each (now individual) source
-        sid = s["id"]
-        stype = s.get("type")
-        fmt = s.get("format")
+    for s_conf in sources_to_process_filtered:
+        sid = s_conf["id"]
+        source_title = s_conf.get("title", sid)
+        source_type = s_conf.get("type")
+        source_format = s_conf.get("format")
+        source_location = s_conf.get("path", s_conf.get("url", "N/A"))
+
+        # Get chunking config specific to this source, if any, else global default
+        doc_specific_chunking_config = s_conf.get("chunking", global_chunking_config)
         
-        # Merge loader options from source with config defaults if any
-        # (Example, not strictly in your config, but good practice)
-        loader_opts = {**rag_config.get("loader_options", {}), **s.get("loader_options", {})}
+        # Hash the configuration for this specific source to check for reprocessing needs
+        source_processing_config_hash_dict = {
+            "source_id": sid,
+            "format": source_format,
+            "type": source_type,
+            "loader_options": s_conf.get("loader_options", {}),
+            "chunking_config": doc_specific_chunking_config
+        }
+        current_source_config_hash = get_config_hash(source_processing_config_hash_dict) # Generate hash for current config
         
-        # Initialize meta with base info and any direct metadata from source
-        doc_meta = {k: v for k, v in s.items() if k not in {"id", "type", "path", "abs_path", "url", "title", "loader_options", "chunking"}}
-        doc_meta["source_id"] = sid
-        doc_meta["source_type"] = stype
-        if s.get("path"): doc_meta["file_path_relative"] = s["path"]
-        if s.get("abs_path"): doc_meta["file_path_absolute"] = s["abs_path"]
-        if s.get("url"): doc_meta["url"] = s["url"]
-        doc_meta["format"] = fmt
-        doc_meta["loader_options_used"] = loader_opts # Track options used
+        doc_summary_entry = {
+            "id": sid,
+            "title": source_title,
+            "location": source_location,
+            "format": source_format,
+            "chunking_strategy_planned": doc_specific_chunking_config.get("strategy"),
+            "source_processing_config_hash": current_source_config_hash,
+            "pipeline_config_hash": overall_rag_pipeline_config_hash,
+            "status": "skipped_reprocess",
+            "message": "Skipped (already processed with same config)",
+            "chunks_generated": 0,
+            "parents_generated": 0
+        }
+        
+        summary_output["processed_sources_details"].append(doc_summary_entry)
+
+        # --- REPROCESSING / CACHING CHECK ---
+        manifest_entry = current_manifest.get(sid)
+        if (not args.force_reprocess and
+            manifest_entry and
+            manifest_entry.get("source_processing_config_hash") == current_source_config_hash and
+            manifest_entry.get("pipeline_config_hash") == overall_rag_pipeline_config_hash and
+            (base_output_dir / manifest_entry.get("output_chunks_path", "")).exists() and
+            (base_output_dir / manifest_entry.get("output_parents_path", "")).exists()
+            ):
+            logger.info(f"Skipping source '{sid}': Manifest indicates already processed with same config. Use --force-reprocess to override.")
+            doc_summary_entry.update({
+                "status": "skipped_cached",
+                "message": "Skipped (matched manifest config & files).",
+                "chunks_generated": manifest_entry.get("chunks_generated", 0),
+                "parents_generated": manifest_entry.get("parents_generated", 0)
+            })
+            documents.append(None) # Add a placeholder for consistency if iterating based on 'documents' length
+            continue # Move to next source
+        
+        # If not skipped, then begin processing
+        doc_summary_entry["status"] = "processing"
+        doc_summary_entry["message"] = "Processing started."
+
+        # Simplified reprocess check:
+        # For a truly robust system, you'd load a manifest file that stores the config_hash
+        # for each source previously processed. Here, we simulate by checking a placeholder.
+        # This part requires a central manifest file. For now, it's a conceptual check.
+        # If args.force_reprocess is False:
+        #   Check manifest for sid AND current_source_config_hash. If match, skip.
+        # else:
+        #   Proceed with processing.
+
+        # For this version, we'll let the processing run unless explicitly told NOT to reprocess
+        # and we can reliably determine it's been processed. For now, always process unless --force-reprocess is false
+        # AND some (non-implemented) manifest says it's ok.
+        
+        # --- (Existing Document Load and Normalize Logic) ---
+        # This part remains mostly the same, creating `Document` objects.
+        # It needs to handle raw/extracted content for structural chunkers later.
+        
 
         full_text = ""
-        pre_chunks: List[str] = []
-        source_location: str = "" # Actual source path/url
-
-        if stype == "file":
-            abs_path = s["abs_path"]
-            source_location = abs_path
-            # load_file_by_format returns (text, pre_chunks, abs_path_str, extra_meta_from_loader)
-            full_text, pre_chunks, _, extra_meta_from_loader = load_file_by_format(
-                project_root, s["path"], fmt, loader_opts
-            )
-            doc_meta.update(extra_meta_from_loader) # Merge any extra metadata (e.g., Markdown front matter)
-
-        elif stype == "url":
-            source_location = s["url"]
-            full_text = load_url(s["url"], timeout=args.timeout)
-        else:
-            logger.error(f"Unsupported type '{stype}' for source '{sid}'. Skipping.")
-            continue
-
-        full_text = normalize_text(full_text)
-        if not full_text and not pre_chunks:
-            logger.warning(f"No text extracted or pre-chunks generated for {sid}. Skipping document.")
-            continue
+        pre_chunks: List[str] = [] # For CSV/Excel rows
+        actual_source_path_or_url = "" # The abs path or URL that the document content was loaded from
+        extracted_meta_from_loader: Dict[str, Any] = {} # For markdown front matter, etc.
         
-        # Final document metadata, including source-specific chunking config if present
-        if s.get("chunking"):
-            doc_meta["chunking_config_override"] = s["chunking"]
+        try:
+            if source_type == "file":
+                abs_path_str = Path(s_conf["abs_path"])
+                # Decide if we need to load RAW content for structural markdown/html chunkers
+                # This check happens *before* load_file_by_format
+                strategy_to_apply = doc_specific_chunking_config.get("strategy")
+                is_structural_html_md = strategy_to_apply in ["markdown_header", "html_section"]
+                
+                if is_structural_html_md:
+                    logger.info(f"Loading RAW content for '{sid}' (format: {source_format}) due to structural chunking strategy '{strategy_to_apply}'.")
+                    # Special load: raw content needed for structural splitters
+                    if source_format == "md":
+                        raw_content, extracted_meta_from_loader = load_md_with_frontmatter(abs_path_str)
+                    elif source_format == "html":
+                        raw_content = load_html_raw(abs_path_str) # Your raw html loader
+                    else: # Fallback
+                        raw_content = load_txt_like(abs_path_str)
+                    
+                    full_text = raw_content # Keep it raw for the chunker
+                    pre_chunks = [] # Structural chunkers don't rely on pre_chunks
+                else: # Standard loading/cleaning
+                    logger.info(f"Loading file '{sid}' (format: {source_format}) for standard chunking.")
+                    full_text, pre_chunks, _, extracted_meta_from_loader = load_file_by_format(
+                        project_root, # Base path argument is technically not used by load_file_by_format anymore
+                        s_conf["path"],  # Relative path
+                        source_format,
+                        s_conf.get("loader_options", {})
+                    )
+                actual_source_path_or_url = s_conf["abs_path"] # Store absolute path as actual source used
 
-        doc = Document(
-            id=sid,
-            title=s.get("title", sid),
-            source_type=stype,
-            source=source_location,
-            text=full_text,
-            meta=doc_meta # The full processed metadata
-        )
+            elif source_type == "url":
+                logger.info(f"Loading URL '{sid}': {s_conf['url']}")
+                full_text, pre_chunks_from_url = load_url_content(s_conf["url"], timeout=args.timeout)
+                pre_chunks.extend(pre_chunks_from_url) # Append any pre-chunks from URL (e.g., if it extracts tables)
+                actual_source_path_or_url = s_conf["url"]
 
-        # Attach pre-chunks to meta so chunking stage can pick them up (CSV/TSV/Excel)
-        if pre_chunks:
-            doc.meta["_pre_chunks"] = pre_chunks
-            doc.meta["_structured_rows"] = True # Flag for structured data
-
-        documents.append(doc)
-
-    logger.info(f"Successfully loaded and normalized {len(documents)} documents.")
-
-    # --- Write documents JSONL ---
-    out_docs.parent.mkdir(parents=True, exist_ok=True)
-    with out_docs.open("w", encoding="utf-8") as f:
-        for d in documents:
-            f.write(json.dumps(asdict(d), ensure_ascii=False) + "\n")
-    logger.info(f"Wrote processed documents to {out_docs}")
-
-    # --- Chunk and write chunks JSONL ---
-    out_chunks.parent.mkdir(parents=True, exist_ok=True)
-    
-    if not CHUNK_STRATEGY_REGISTRY or not Chunk or not BaseChunkingStrategy:
-        logger.critical("Chunking components not properly loaded. Cannot perform chunking.")
-        sys.exit(1) # Exit if chunking framework is not available
-
-    total_chunks_written = 0
-    with out_chunks.open("w", encoding="utf-8") as f:
-        for d in documents:
-            # Determine chunking strategy and config for this document
-            # Prioritize source-specific chunking config (from data_sources.yaml)
-            # then fall back to global config (from config.yaml)
-            doc_chunking_config = d.meta.get("chunking_config_override", global_chunking_config)
-            
-            strategy_name = doc_chunking_config.get("strategy")
-            strategy_params = doc_chunking_config.get(strategy_name, {}) # Params specific to chosen strategy
-
-            if not strategy_name or strategy_name not in CHUNK_STRATEGY_REGISTRY:
-                logger.error(f"No valid chunking strategy '{strategy_name}' found for document '{d.id}'. Skipping chunking.")
+            else:
+                logger.error(f"Unsupported type '{source_type}' for source '{sid}'. Skipping.")
+                doc_summary_entry["status"] = "failed_loading"
+                doc_summary_entry["message"] = f"Unsupported source type: {source_type}"
+                summary_output["processed_sources_details"].append(doc_summary_entry)
                 continue
             
-            # --- Handle Structured Data (Pre-chunks) ---
-            if d.meta.get("_structured_rows"):
-                logger.info(f"Processing structured rows for document '{d.id}'. Each row becomes a chunk.")
-                pre_chunks = d.meta["_pre_chunks"]
-                for i, txt in enumerate(pre_chunks):
-                    clean_text = normalize_text(txt)
-                    if not clean_text:
-                        continue # Skip empty chunks
+            # For non-structural chunkers, normalize the text AFTER loading (if not already raw)
+            if not is_structural_html_md:
+                full_text = normalize_text(full_text)
 
-                    # Use document metadata, but remove internal keys
-                    chunk_meta = {k: v for k, v in d.meta.items() if not k.startswith("_")}
-                    chunk_meta.update(
-                        {
-                            "chunk_index_in_doc": i,
-                            "n_chars": len(clean_text),
-                            "chunk_strategy_applied": "structured_rows",
-                            # Add specific structured data metadata if useful
-                            "structured_row_processed": True
+            if not full_text.strip() and not pre_chunks:
+                logger.warning(f"No text extracted or pre-chunks generated for {sid}. Skipping document.")
+                doc_summary["status"] = "failed_loading"
+                doc_summary["message"] = "No extractable text"
+                summary_output["processed_sources_details"].append(doc_summary)
+                continue
+            
+            # Build final metadata for the Document object
+            doc_meta = {k: v for k, v in s_conf.items() if k not in {"id", "title", "path", "abs_path", "url", "chunking", "loader_options", "type", "format"}}
+            doc_meta["source_id"] = sid
+            doc_meta["source_type"] = source_type
+            doc_meta["file_path_relative"] = s_conf.get("path") # Can be None for URL
+            doc_meta["file_path_absolute"] = s_conf.get("abs_path") # Can be None for URL
+            doc_meta["url"] = s_conf.get("url") # Can be None for file
+            doc_meta["format"] = source_format
+            doc_meta["loader_options_used"] = s_conf.get("loader_options", {})
+            doc_meta.update(extracted_meta_from_loader) # Blend in any metadata from loader (e.g., MD front matter)
+            doc_meta["chunking_config_for_this_source"] = doc_specific_chunking_config # Keep track of exact config
+            doc_meta["source_config_hash"] = current_source_config_hash # Unique hash
+            doc_meta["pipeline_config_hash"] = overall_rag_pipeline_config_hash
+            
+            doc = Document(
+                id=sid,
+                title=source_title,
+                source_type=source_type,
+                source=actual_source_path_or_url, # The actual path/URL content came from
+                text=full_text,
+                meta=doc_meta # Full processed metadata
+            )
+
+            # Attach pre-chunks to meta for chunking stage (CSV/TSV/Excel/etc)
+            if pre_chunks:
+                doc.meta["_pre_chunks"] = pre_chunks
+                doc.meta["_structured_rows"] = True # Flag for special handling in chunking
+            
+            documents.append(doc)
+            doc_summary_entry["status"] = "loaded"
+            doc_summary_entry["message"] = "Document loaded successfully."
+            summary_output["processed_sources_details"].append(doc_summary)
+
+        except Exception as e:
+            logger.error(f"Error processing source '{sid}': {e}", exc_info=True)
+            doc_summary_entry["status"] = "failed_loading"
+            doc_summary_entry["message"] = str(e)
+            continue            
+    
+    documents_to_process = [d for d in documents if d is not None]
+    
+    summary_output["total_documents_loaded"] = len(documents_to_process)
+    logger.info(f"Loaded {len(documents_to_process)} documents for processing (after filtering skips).")
+
+    if documents_to_process:
+        with final_output_docs_path.open("w", encoding="utf-8") as f:
+            for d in documents_to_process:
+                f.write(json.dumps(asdict(d), ensure_ascii=False) + "\n")
+        logger.info(f"Wrote processed documents to {final_output_docs_path}")
+    else:
+        logger.warning("No documents loaded for processing. Skipping writing to output-docs.")
+
+    if not (CHUNK_STRATEGY_REGISTRY and Chunk and BaseChunkingStrategy):
+        logger.critical("Chunking components not properly loaded. Cannot perform chunking.")
+        sys.exit(1)
+    
+    if not documents_to_process:
+        logger.warning("No documents to chunk. Skipping chunking phase.")
+    else:
+        logger.info("Starting document chunking and writing to output files segregating children and parents...")
+        
+        with final_output_chunks_path.open("w", encoding="utf-8") as f_child_chunks, \
+             final_output_parents_path.open("w", encoding="utf-8") as f_parent_chunks:
+            
+            for doc in documents_to_process:
+                doc_summary_entry = next((s for s in summary_output["processed_sources_details"] if s["id"] == doc.id), None)
+                if not doc_summary_entry or doc_summary_entry["status"] != "loaded":
+                    logger.warning(f"Skipping chunking for document '{doc.id}' due to prior loading issue.")
+                    continue
+
+                doc_chunking_config = doc.meta.get("chunking_config_for_this_source", global_chunking_config)
+                strategy_name = doc_chunking_config.get("strategy")
+                strategy_params = doc_chunking_config.get(strategy_name, {})
+
+                if not strategy_name or strategy_name not in CHUNK_STRATEGY_REGISTRY:
+                    logger.error(f"No valid chunking strategy '{strategy_name}' found for document '{doc.id}'. Skipping chunking.")
+                    doc_summary_entry.update({
+                        "status": "failed_chunking_config",
+                        "message": f"Invalid/missing chunking strategy: {strategy_name}"
+                    })
+                    continue
+                
+                processed_chunks_for_doc: List[Chunk] = []
+
+                if doc.meta.get("_structured_rows", False) and doc.meta.get("_pre_chunks"):
+                    logger.info(f"Processing structured data (pre-chunks) for '{doc.id}'.")
+                    pre_chunks_data = doc.meta["_pre_chunks"]
+                    for i, txt_row in enumerate(pre_chunks_data):
+                        clean_txt_row = normalize_text(txt_row)
+                        if not clean_txt_row: continue
+                        chunk_meta = {
+                            **{k: v for k, v in doc.meta.items() if not k.startswith("_")},
+                            "chunk_index": i,
+                            "n_chars": len(clean_txt_row),
+                            "strategy": "structured_rows",
+                            "structured_row_index": i,
+                            "chunk_type": "child",
+                            **strategy_params
                         }
-                    )
-                    # Convert metadata to Chroma-compatible format
-                    chroma_compatible_meta = safe_meta(chunk_meta)
+                        processed_chunks_for_doc.append(Chunk(
+                            id=f"{doc.id}_c{i:04d}",
+                            doc_id=doc.id,
+                            text=clean_txt_row,
+                            metadata=safe_meta(chunk_meta)
+                        ))
+                else:
+                    try:
+                        ChunkerClass: Type[BaseChunkingStrategy] = CHUNK_STRATEGY_REGISTRY[strategy_name]
+                        
+                        effective_chunk_size = strategy_params.get("chunk_size", rag_config.get("chunk_size", 500))
+                        effective_chunk_overlap = strategy_params.get("chunk_overlap", rag_config.get("chunk_overlap", 50))
+                        
+                        chunker_kwargs = {**strategy_params}
+                        if strategy_name == "proposition":
+                            chunker_kwargs["settings"] = settings
+                            chunker_kwargs["global_llm_config"] = full_config.get("llm", {})
 
-                    chunk_obj = Chunk(
-                        id=f"{d.id}::c{i:05d}", # Ensure unique and stable chunk ID
-                        doc_id=d.id,
-                        text=clean_text,
-                        metadata=chroma_compatible_meta
-                    )
-                    f.write(json.dumps(asdict(chunk_obj), ensure_ascii=False) + "\n")
-                    total_chunks_written += 1
-                continue # Move to next document
+                        chunker_instance = ChunkerClass(
+                            chunk_size=effective_chunk_size,
+                            chunk_overlap=effective_chunk_overlap,
+                            **chunker_kwargs
+                        )
+                        
+                        logger.info(f"Chunking '{doc.id}' with strategy '{strategy_name}' (Size: {effective_chunk_size}, Overlap: {effective_chunk_overlap})")
+                        current_doc_chunks: List[Chunk] = chunker_instance.split_text(
+                            text=doc.text,
+                            document_id=doc.id,
+                            document_metadata={k: v for k, v in doc.meta.items() if not k.startswith("_")}
+                        )
+                        processed_chunks_for_doc.extend(current_doc_chunks)
 
-            # --- Handle Unstructured Text Chunking ---
-            try:
-                # Instantiate the selected chunking strategy
-                ChunkerClass: Type[BaseChunkingStrategy] = CHUNK_STRATEGY_REGISTRY[strategy_name]
+                    except Exception as e:
+                        logger.error(f"Failed to chunk document '{doc.id}' with strategy '{strategy_name}': {e}. Skipping.", exc_info=True)
+                        doc_summary_entry.update({
+                            "status": "failed_chunking",
+                            "message": str(e)
+                        })
+                        continue
                 
-                # Use global chunk_size/overlap from rag_config as defaults,
-                # allowing strategy_params to override if they contain these keys.
-                effective_chunk_size = strategy_params.get("chunk_size", rag_config.get("chunk_size", 500))
-                effective_chunk_overlap = strategy_params.get("chunk_overlap", rag_config.get("chunk_overlap", 50))
+                current_doc_child_chunks = 0
+                current_doc_parent_chunks = 0
 
-                # Special handling for LLM in PropositionChunking: need to pass `settings`
-                chunker_kwargs = {**strategy_params}
-                if strategy_name == "proposition":
-                    chunker_kwargs["settings"] = settings # Pass the global settings object for LLM config
-                    chunker_kwargs["global_rag_config"] = rag_config # Pass for llm model/temp config
-
-                chunker_instance = ChunkerClass(
-                    chunk_size=effective_chunk_size,
-                    chunk_overlap=effective_chunk_overlap,
-                    **chunker_kwargs
-                )
-                
-                # Execute chunking with full document text and its metadata
-                processed_chunks: List[Chunk] = chunker_instance.split_text(
-                    text=d.text,
-                    document_id=d.id,
-                    document_metadata=d.meta
-                )
-
-                for chunk_obj in processed_chunks:
-                    # Enrich chunk metadata with strategy info
+                for chunk_obj in processed_chunks_for_doc:
                     chunk_obj.metadata["chunk_strategy_applied"] = strategy_name
                     chunk_obj.metadata["chunk_size_actual"] = len(chunk_obj.text)
-                    # Convert to Chroma-compatible format
-                    chroma_compatible_meta = safe_meta(chunk_obj.metadata)
                     
-                    chunk_obj.metadata = chroma_compatible_meta # Update metadata to safe version
-                    f.write(json.dumps(asdict(chunk_obj), ensure_ascii=False) + "\n")
-                    total_chunks_written += 1
+                    if chunk_obj.metadata.get("chunk_type") == "parent":
+                        f_parent_chunks.write(json.dumps(asdict(chunk_obj), ensure_ascii=False) + "\n")
+                        current_doc_parent_chunks += 1
+                    else:
+                        f_child_chunks.write(json.dumps(asdict(chunk_obj), ensure_ascii=False) + "\n")
+                        current_doc_child_chunks += 1
+                
+                doc_summary_entry.update({
+                     "chunks_generated": current_doc_child_chunks,
+                     "parents_generated": current_doc_parent_chunks,
+                     "status": "processed",
+                     "message": "Chunks generated successfully."
+                })
+                
+                summary_output["total_chunks_written"] += current_doc_child_chunks
+                summary_output["total_parent_chunks_written"] += current_doc_parent_chunks
 
-            except Exception as e:
-                logger.error(f"Failed to chunk document '{d.id}' with strategy '{strategy_name}': {e}. Skipping chunks for this document.")
-                continue
+    logger.info(f"Wrote {summary_output['total_chunks_written']} child/standard chunks to {final_output_chunks_path}")
+    logger.info(f"Wrote {summary_output['total_parent_chunks_written']} parent chunks to {final_output_parents_path}")
+    logger.info("--- Phase A complete ---")
 
-    logger.info(f"Wrote {total_chunks_written} chunks to {out_chunks}")
+    # --- Final step: Save the updated manifest ---
+    # Prepare manifest entries based on processed_sources_details
+    for entry in summary_output["processed_sources_details"]:
+        if entry["status"] == "processed" or entry["status"] == "skipped_cached":
+            updated_manifest[entry["id"]] = {
+                "source_processing_config_hash": entry["source_processing_config_hash"],
+                "pipeline_config_hash": entry["pipeline_config_hash"],
+                "output_chunks_path": str(final_output_chunks_path.relative_to(base_output_dir)),
+                "output_parents_path": str(final_output_parents_path.relative_to(base_output_dir)),
+                "chunks_generated": entry["chunks_generated"],
+                "parents_generated": entry["parents_generated"],
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        elif entry["id"] in updated_manifest and \
+            (entry["status"] == "failed_loading" or entry["status"] == "failed_chunking" or entry["status"] == "failed_chunking_config"):
+            updated_manifest.pop(entry["id"], None)
+            
+    save_manifest(manifest_path, updated_manifest)
+
+    # Final Summary Output to console
+    print("\n--- Phase A Execution Summary ---")
+    print(json.dumps(summary_output, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
