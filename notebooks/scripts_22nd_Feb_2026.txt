@@ -1,0 +1,69 @@
+22nd Feb 2026.ipynb
+!pip install -q tensorflow
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
+from tensorflow.keras.preprocessing import image
+from sklearn.metrics.pairwise import cosine_similarity
+from PIL import Image
+# load the pretrained model
+model = VGG16(weights='imagenet', include_top=False, pooling = 'avg')
+im1_path = "/content/Gemini_Generated_Image_sletu2sletu2slet (1).png"
+im2_path = "/content/Gemini_Generated_Image_sletu2sletu2slet (2).png"
+# resize the images for VGG16 input to 224*224
+img_1 = Image.open(im1_path).convert("RGB").resize((224,224))
+img_2 = Image.open(im2_path).convert("RGB").resize((224,224))
+def compute_pixel_distance(img_1, img_2):
+arr1 = np.array(img_1, dtype = np.float32)
+arr2 = np.array(img_2, dtype = np.float32)
+return np.mean((arr1-arr2)**2)
+mse_score = compute_pixel_distance(img_1, img_2)
+print("MSE Score: ", mse_score)
+mse_score = compute_pixel_distance(img_1, img_1)
+print("MSE Score: ", mse_score)
+mse_score = compute_pixel_distance(img_2, img_2)
+print("MSE Score: ", mse_score)
+from platform import processor
+def get_image_embeddings(img):
+# PIL image is getting converted to numpy array
+x = image.img_to_array(img)
+# I am expanding one dimension to make the input dimension to this model as (1,224,224,3)
+# since the model accepts the input as a batch of images, the input numpy array should
+# also be of a batch shape (b, m,n, c)
+x = np.expand_dims(x, axis=0)
+# preprocessing of the image as per VGG 16 input
+x = preprocess_input(x)
+embeddings = model.predict(x, verbose=0)
+return embeddings
+emb1 = get_image_embeddings(img_1)
+emb2 = get_image_embeddings(img_2)
+cosine = cosine_similarity(emb1, emb2)
+print("Cosine Similarity: ", cosine)
+## Vision Transformers
+import torch
+import numpy as np
+from transformers import AutoImageProcessor, AutoModel
+from sklearn.metrics.pairwise import cosine_similarity
+from PIL import Image
+model_ckpt = "google/vit-base-patch16-224"
+# vision transformer from google where 16*16 patches were created on an input image 224*224
+processor = AutoImageProcessor.from_pretrained(model_ckpt)
+model = AutoModel.from_pretrained(model_ckpt)
+model.eval() # using the model for predictions
+im1_path = "/content/Gemini_Generated_Image_sletu2sletu2slet (1).png"
+im2_path = "/content/Gemini_Generated_Image_sletu2sletu2slet (2).png"
+def get_image_embedding(img):
+# Preprocess the image (resizing, normalization) to match model expectations
+inputs = processor(images=img, return_tensors="pt")
+with torch.no_grad():
+outputs = model(**inputs)
+# Extract the [CLS] token embedding which represents the entire image.
+# It is located at the 0th index of the sequence length dimension.
+embedding = outputs.last_hidden_state[:, 0, :].numpy()
+return embedding
+img_a = Image.open(im1_path).convert("RGB").resize((224, 224))
+img_b = Image.open(im2_path).convert("RGB").resize((224, 224))
+emb_a = get_image_embedding(img_a)
+emb_b = get_image_embedding(img_b)
+cosine = cosine_similarity(emb_a, emb_b)
+print("Cosine Similarity: ", cosine)
