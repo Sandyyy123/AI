@@ -35,6 +35,7 @@ chroma_db/
 faiss_index/
 vector_store/
 chroma_db_*/
+qdrant_storage/
 
 # =====================
 # OS files
