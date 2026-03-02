@@ -3,6 +3,7 @@
 import logging
 from typing import List, Dict, Any, Optional, Type
 
+logger = logging.getLogger(__name__)
 # --- Corrected Import: Assuming 'config' is directly importable from project root ---
 try:
     from config import Settings, load_settings
@@ -34,8 +35,7 @@ except ImportError:
     Ranker = None
     logger.warning("Flashrank not installed. Reranking functionality will be disabled. Install with `pip install flashrank`.")
 
-# --- Logging Setup ---
-logger = logging.getLogger(__name__) # Define logger at the top after initial imports
+
 
 # --- Component Registry ---
 RERANKER_REGISTRY: Dict[str, Type['BaseReranker']] = {} # Using specific type hint now

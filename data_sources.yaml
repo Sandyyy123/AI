@@ -120,7 +120,7 @@ sources:
     # the format-specific chunker (like html_section for a .html file) might be better
     # determined dynamically in phase_a_build_chunks.
 
-  ✅ Structured datasets (CSV/TSV/Excel)
+  # ✅ Structured datasets (CSV/TSV/Excel)
   - id: structured_data
     type: folder
     format: auto

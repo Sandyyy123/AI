@@ -43,6 +43,8 @@ Usage Example:
     --id-prefix my_unique_run \
     --embedder openrouter --model text-embedding-3-small
 """
+# model_slug removes probelmatic strings such as those with spaces, special characters or uppercase letters
+from scripts.utils import model_slug
 
 # ---- SQLITE PATCH (must be first as chromadb indirectly uses it) ----
 import sys
@@ -61,6 +63,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
+import logging
 
 # NEW: Import for Chromadb
 import chromadb # Even though abstracted, direct import might be used by ChromaVectorStore
@@ -68,7 +71,6 @@ import yaml
 import logging
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Internal RAG system imports ---
@@ -170,13 +172,6 @@ def get_embeddings(
         voyage_input_type = rag_config.get("voyage_embed_input_type", "document")
         return embed_voyage(texts, model=model, input_type=voyage_input_type)
     raise SystemExit(f"Unknown embedder: {embedder}")
-
-
-def model_slug(s: str) -> str:
-    """Converts a string to a URL-friendly slug."""
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    return s.strip("_")[:80]
 
 
 # --- NEW IMPORTS: Vector Store Abstraction ---
@@ -382,6 +377,8 @@ def main():
     )
 
     args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # --- Setup ---
     project_root = Path(__file__).resolve().parents[1] 

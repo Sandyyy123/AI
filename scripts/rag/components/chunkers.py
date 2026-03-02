@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Callable, Type, Tuple
 import sys
 from pathlib import Path
+import re
 
 # --- Conditional imports for LangChain text splitters ---
 try:
@@ -395,55 +396,138 @@ class PropositionChunking(BaseChunkingStrategy):
             separators=["\n\n", "\n", ".", "!", "?", " "],
             keep_separator=False
         )
+    def split_text(self, text: str, document_id: str, document_metadata: Dict[str, Any]) -> List[Chunk]:
+    # pre-split into manageable windows
+        windows = self.pre_splitter.split_text(text)
+
+        out: List[Chunk] = []
+        prev = ""
+        for i, w in enumerate(windows):
+            props = self.proposition_chain.invoke({
+                "title": document_metadata.get("title", document_id),
+                "previous_window": prev,
+                "current_chunk": w
+            })
+            prev = w
+
+        # props is newline-separated sentences
+            for j, line in enumerate([ln.strip() for ln in props.split("\n") if ln.strip()]):
+                idx = len(out)
+                cid = self._generate_chunk_id(document_id, idx)
+                meta = {
+                    **document_metadata,
+                    "chunk_index": idx,
+                    "strategy": "proposition",
+                    "chunk_type": "child",
+                    "source_window_index": i,
+                }
+                out.append(Chunk(id=cid, doc_id=document_id, text=line, metadata=meta))
+        return out
+
+@register_chunk_strategy("parent_document")
+class ParentDocumentChunking(BaseChunkingStrategy):
+    """
+    Implements a Parent-Document Chunking strategy.
+    This strategy creates larger 'parent' chunks and smaller 'child' chunks.
+    Retrieval happens on child chunks, but the full parent chunk is returned as context.
+    
+    Configuration parameters:
+    - parent_chunk_size (int): Max size for parent chunks.
+    - parent_chunk_overlap (int): Overlap for parent chunks.
+    - child_chunk_size (int): Max size for child chunks (used for retrieval).
+    - child_chunk_overlap (int): Overlap for child chunks.
+    - parent_separators (List[str], optional): Separators for parent splitter.
+    - child_separators (List[str], optional): Separators for child splitter.
+    """
+    def __init__(self, chunk_size: int, chunk_overlap: int, **kwargs):
+        # BaseChunkingStrategy's chunk_size/overlap might be overridden by specific parent/child settings
+        super().__init__(chunk_size, chunk_overlap, **kwargs)
+
+        # Extract specific settings for parent and child splitters from kwargs or config
+        self.parent_chunk_size = kwargs.get("parent_chunk_size", 1000)
+        self.parent_chunk_overlap = kwargs.get("parent_chunk_overlap", 200)
+        self.child_chunk_size = kwargs.get("child_chunk_size", 200)
+        self.child_chunk_overlap = kwargs.get("child_chunk_overlap", 50)
+        
+        parent_separators = kwargs.get("parent_separators", ["\n\n", "\n", " ", ""])
+        child_separators = kwargs.get("child_separators", ["\n\n", "\n", " ", ""])
+
+        self.parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.parent_chunk_size,
+            chunk_overlap=self.parent_chunk_overlap,
+            separators=parent_separators
+        )
+        self.child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.child_chunk_size,
+            chunk_overlap=self.child_chunk_overlap,
+            separators=child_separators
+        )
+        
+        logger.info(f"ParentDocumentChunking initialized: "
+                    f"Parent (size={self.parent_chunk_size}, overlap={self.parent_chunk_overlap}), "
+                    f"Child (size={self.child_chunk_size}, overlap={self.child_chunk_overlap})")
 
     def split_text(self, text: str, document_id: str, document_metadata: Dict[str, Any]) -> List[Chunk]:
         """
-        Splits a document's text into propositions using an LLM.
-        The document is first pre-split into manageable chunks to stay within LLM context limits.
+        Splits the input text into parent documents, then each parent document into child chunks.
+        Returns the child chunks, with metadata linking them to their corresponding parent.
         """
-        doc_title = document_metadata.get("title", "Untitled Document")
+        all_child_chunks: List[Chunk] = []
         
-        # HTML/MD raw text is expected for *structural* chunkers. If the input text here
-        # is already cleaned/extracted, it's fine for recursive/sentence/proposition.
-        # This function operates on the 'text' property of the Document object,
-        # which will be pre-cleaned by phase_a_build_chunks.py
+        # 1. Split the original text into larger "parent" segments
+        # We use create_documents to get LangChain Document objects which can carry metadata
+        parent_lc_docs = self.parent_splitter.create_documents([text], metadatas=[document_metadata])
+
+        # Store parent content temporarily to be written to a separate file (e.g., parents.jsonl)
+        # This will need to be handled by phase_a_build_chunks.py
+        # For now, let's just make sure each parent has a unique ID and its content is noted.
         
-        pre_chunks = self.pre_splitter.split_text(text)
+        for parent_idx, lc_parent_doc in enumerate(parent_lc_docs):
+            # Generate a unique ID for each parent document
+            parent_chunk_id = self._generate_chunk_id(document_id, parent_idx, prefix="parent")
+            parent_text = lc_parent_doc.page_content
 
-        all_propositions: List[str] = []
-        previous_window = ""
-
-        for i, small_chunk in enumerate(pre_chunks):
-            try:
-                response_content = self.proposition_chain.invoke({
-                    "title": doc_title,
-                    "previous_window": previous_window,
-                    "current_chunk": small_chunk
-                })
-                
-                propositions = [p.strip() for p in response_content.split("\n") if p.strip()]
-                all_propositions.extend(propositions)
-
-                previous_window = small_chunk
-            except Exception as e:
-                logger.error(f"Error during proposition generation for document {document_id}, pre-chunk {i}: {e}", exc_info=True)
-                all_propositions.append(small_chunk) # Fallback to original small chunk if LLM fails
+            # IMPORTANT: The calling script (phase_a_build_chunks.py) needs to capture
+            # these parent texts and their IDs to write to the --parents-path file.
+            # This 'split_text' method only returns child chunks.
+            # We can't directly output parents from here, as the return signature is List[Chunk]
+            # One way to handle this is to modify the Chunk object to include parent_content,
+            # or have phase_a_build_chunks.py iterate over the original text with the parent_splitter
+            # to generate parents separately.
             
-        final_chunks = []
-        for i, prop_text in enumerate(all_propositions):
-            chunk_meta = {
-                **document_metadata,
-                "chunk_index": i,
-                "strategy": "proposition",
-                "original_doc_title": doc_title,
-                "chunk_size_actual": len(prop_text)
-            }
-            final_chunks.append(
-                Chunk(
-                    id=self._generate_chunk_id(document_id, i),
-                    doc_id=document_id,
-                    text=prop_text,
-                    metadata=chunk_meta
+            # For this example, we'll assume the parent_id is enough to reconstruct the parent.
+            # The actual parent content would be stored in a docstore indexed by parent_id.
+            
+            # 2. Split each parent text into smaller "child" chunks
+            child_raw_texts = self.child_splitter.split_text(parent_text)
+
+            for child_idx, child_text in enumerate(child_raw_texts):
+                child_chunk_id = self._generate_chunk_id(parent_chunk_id, child_idx, prefix="child")
+                
+                # Metadata for the child chunk MUST include the parent_chunk_id
+                child_metadata = {
+                    **document_metadata, # Original document metadata
+                    **lc_parent_doc.metadata, # Parent chunk's metadata (if any from parent splitter)
+                    "original_doc_id": document_id, # Keep track of the very original document
+                    "parent_chunk_id": parent_chunk_id, # CRITICAL: Link to its parent chunk
+                    "parent_chunk_index": parent_idx,
+                    "child_chunk_index": child_idx,
+                    "strategy": "parent_document_child",
+                    "chunk_size_actual": len(child_text)
+                }
+
+                all_child_chunks.append(
+                    Chunk(
+                        id=child_chunk_id,
+                        doc_id=document_id, # The original document ID, or parent_chunk_id if that's preferred for filtering
+                        text=child_text,
+                        metadata=child_metadata
+                    )
                 )
-            )
-        return final_chunks
+        
+        logger.info(f"Generated {len(all_child_chunks)} child chunks for document {document_id} using ParentDocumentChunking.")
+        return all_child_chunks
+
+    def _generate_chunk_id(self, base_id: str, index: int, prefix: str = "") -> str:
+        """Helper to generate a unique chunk ID, with an optional prefix for parent/child."""
+        return f"{base_id}_{prefix}_{index:04d}"

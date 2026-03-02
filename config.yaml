@@ -2,19 +2,24 @@ llm:
   provider: openrouter
   model: gpt-4o-mini
   temperature: 0.3
-
 rag:
   chunk_size: 500
   chunk_overlap: 50
   embedding_model: text-embedding-3-small
   embedding_provider: openrouter # Explicitly set, or it will default to llm.provider
-
   # New chunking configuration
   chunking:
-    # Default strategy
-    strategy: recursive_character
+    #strategy: parent_document     
+    #parent_document:
+    #parent_chunk_size: 2000
+    #parent_chunk_overlap: 200
+    #child_chunk_size: 100
+    #child_chunk_overlap: 10
+    #parent_separators: ["\n\n", "\n", " ", ""]
+    #child_separators: ["\n\n", "\n", " ", ""]
 
     # Configuration for RecursiveCharacterTextSplitter
+    strategy: recursive_character
     recursive_character:
       # Default separators
       separators: ["\n\n", "\n", " ", ""]
@@ -25,26 +30,21 @@ rag:
       # optional overrides:
       # chunk_size: 500
       # chunk_overlap: 50
-
-
     # Configuration for SentenceTextSplitter (or NLTK-based)
     sentence:
       keep_separator: false
-
     # Configuration for MarkdownHeaderTextSplitter
     markdown_header:
       headers_to_split_on:
-        - {_level: 1, name: h1 }
-        - {_level: 2, name: h2 }
-        - {_level: 3, name: h3 }
+        - {_level: 1, name: h1}
+        - {_level: 2, name: h2}
+        - {_level: 3, name: h3}
       keep_separator: false
-
     # Configuration for HTMLSectionSplitter
     html_section:
       # Example tags – customize as needed for HTML sources
       tags_to_split_on: ["h1", "h2", "h3", "p", "div", "pre", "li", "ul"]
       keep_separator: false
-    
     proposition:
       # Optional: Override global LLM settings for proposition chunking specifically
       llm:
@@ -55,20 +55,17 @@ rag:
       # for the internal RecursiveCharacterTextSplitter used *before* calling the LLM.
       chunk_size: 1500 # Max tokens to feed to the LLM for proposition extraction at once
       chunk_overlap: 150 # Overlap between these internal chunks for better context continuity
-
-       # --- New: Reranker Configuration ---
+      # --- New: Reranker Configuration ---
   reranker:
     strategy: flashrank # e.g., 'flashrank', 'cohere', 'bge_reranker' (future)
     model: ms-marco-TinyBERT-L-2-v2 # Default for Flashrank
     top_n: 5 # How many top documents to keep after reranking
-
   # --- New: Query Transformer Configuration (for MQR) ---
   query_transformer:
     strategy: multi_query # e.g., 'multi_query', 'hyde' (future)
     num_queries: 3 # For multi_query: how many variants to generate
     llm_model: gpt-3.5-turbo-0125 # Optional: specify a smaller/faster LLM for query rewriting
     llm_provider: openrouter # Optional: specify provider for query rewriting LLM
-
   # --- New: Context Distillation Configuration ---
   context_distiller:
     strategy: llm_summarizer # e.g., 'llm_summarizer', 'keyword_extractor' (future)

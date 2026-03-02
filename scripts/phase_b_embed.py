@@ -30,11 +30,31 @@ Input JSONL format (one chunk per line):
 Output:
   Chroma collection with explicit embeddings stored (embeddings=... in upsert)
   (Implicitly, a dictionary of parent documents will be available for retrieval in the next phase.)
+  
+  Usage Example:
+  PYTHONPATH=. python scripts/phase_b_embed.py \
+  --chunks-path outputs/phase_a_processed_chunks_recursive-character_project-plan.jsonl \
+  --vector-store-base-path chroma_db \
+  --vector-store-provider chroma \
+  --chroma-mode local \
+  --output-suffix-chunking-strategy recursive_character \
+  --output-suffix-doc-type project-plan \
+  --id-prefix v1_project_alpha \
+  --embedder openai \
+  --model text-embedding-3-small \
+  --config-path config.yaml \
+  --log-level INFO
+  
+  
   """
+# model_slug removes probelmatic strings such as those with spaces, special characters or uppercase letters
+from scripts.utils import model_slug
+
 
 # ---- SQLITE PATCH (must be first) ----
 import sys
 import pysqlite3
+import logging
 
 from scripts.phase_a_build_chunks import get_config_hash
 
@@ -47,6 +67,8 @@ from dotenv import load_dotenv
 load_dotenv()  # loads .env from project root (current working directory)
 # -------------------------
 
+import logging
+import math
 import argparse
 import json
 import os
@@ -54,11 +76,15 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+from datetime import datetime, date
 
 import yaml
 import requests
 import chromadb
+
+
+# Set up logging
+logger = logging.getLogger(__name__) 
 
 # Use the vector_stores component
 try:
@@ -67,9 +93,7 @@ except ImportError as e:
     logger.critical(f"FATAL: Could not import VECTOR_STORE_REGISTRY from scripts.rag.components.vector_stores: {e}")
     sys.exit(1)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
 
 # --- Internal RAG system imports ---
 # Assuming your Chunk dataclass is here for consistent deserialization
@@ -85,6 +109,53 @@ except ImportError as e:
 # -----------------------------
 # Helpers
 # -----------------------------
+def _coerce_value(v):
+    # Allow None / bool early
+    if v is None or isinstance(v, bool):
+        return v
+
+    # numpy scalars -> Python scalars
+    try:
+        import numpy as np
+        if isinstance(v, (np.integer, np.floating, np.bool_)):
+            v = v.item()
+    except Exception:
+        pass
+
+    # ints / floats / strings
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        # Chroma/Rust does not like NaN/Inf
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    if isinstance(v, str):
+        return v
+
+    # common "safe string" types
+    if isinstance(v, (Path,)):
+        return str(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+
+    # bytes -> try utf-8, else repr
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode("utf-8")
+        except Exception:
+            return repr(v)
+
+    # containers -> JSON string
+    if isinstance(v, (list, tuple, set, dict)):
+        try:
+            return json.dumps(v, ensure_ascii=False, default=str)
+        except Exception:
+            return str(v)
+
+    # fallback
+    return str(v)
+
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     """Loads a JSONL file into a list of dictionaries."""
     rows: List[Dict[str, Any]] = []
@@ -109,59 +180,66 @@ def batched(seq: List[Any], batch_size: int) -> List[List[Any]]:
     return [seq[i : i + batch_size] for i in range(0, len(seq), batch_size)]
 
 
-def model_slug(s: str) -> str:
-    """Converts a string to a URL-friendly slug."""
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    return s.strip("_")[:80]
+def validate_chroma_metadatas(metadatas):
+    for i, m in enumerate(metadatas):
+        if not isinstance(m, dict):
+            raise TypeError(f"Metadata row {i} is not dict: {type(m)} -> {m!r}")
+        for k, v in m.items():
+            if not isinstance(k, str):
+                raise TypeError(f"Metadata row {i} key not str: {k!r} ({type(k)})")
+
+            if v is None:
+                continue
+            if isinstance(v, (str, int, bool)):
+                continue
+            if isinstance(v, float):
+                if math.isnan(v) or math.isinf(v):
+                    raise TypeError(f"Metadata row {i} key {k!r} has NaN/Inf: {v!r}")
+                continue
+
+            raise TypeError(f"Metadata row {i} key {k!r} invalid type {type(v)} value={v!r}")
 
 
-def safe_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+
+def safe_meta(meta):
     """
-    Chroma metadata values must be: str/int/float/bool/None (no lists/dicts).
-    This function coerces unsupported types to JSON strings.
+    Chroma-safe metadata:
+      - keys are str
+      - values are only str/int/float/bool
+      - NO None (drop those keys)
     """
-    out: Dict[str, Any] = {}
+    meta = meta or {}
+    out = {}
     for k, v in meta.items():
-        if v is None or isinstance(v, (str, int, float, bool)):
-            out[k] = v
-        elif isinstance(v, (list, tuple, set, dict)):
-            try:
-                out[k] = json.dumps(v, ensure_ascii=False)
-            except TypeError: # Fallback to string if JSON serialization fails
-                logger.warning(f"Could not JSON-serialize metadata key '{k}' for Chroma. Converting to string.")
-                out[k] = str(v)
-        else:
-            logger.warning(f"Unsupported metadata type for key '{k}' ({type(v)}). Converting to string.")
-            out[k] = str(v)
+        v2 = _coerce_value(v)
+
+        # IMPORTANT: Chroma can choke on None -> drop key
+        if v2 is None:
+            continue
+
+        out[str(k)] = v2
     return out
-
-
 
 # -----------------------------
 # Embedders
 # -----------------------------
-def embed_openai(texts: List[str], model: str) -> List[List[float]]:
+def embed_openai(texts: List[str], model: str, api_key: str, base_url: Optional[str] = None) -> List[List[float]]:
     from openai import OpenAI
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing OPENAI_API_KEY")
-
-    client = OpenAI(api_key=api_key)
+    
+    if base_url is None:
+        base_url = "https://api.openai.com/v1"
+    client = OpenAI(api_key=api_key, base_url=base_url)
     resp = client.embeddings.create(model=model, input=texts)
     return [d.embedding for d in resp.data]
 
 
-def embed_xai(texts: List[str], model: str, base_url: str) -> List[List[float]]:
+def embed_xai(texts: List[str], model: str, base_url: str, api_key: str) -> List[List[float]]:
     """
     xAI uses an OpenAI-compatible API surface. We use OpenAI SDK with base_url.
     """
     from openai import OpenAI
 
-    api_key = os.getenv("XAI_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing XAI_API_KEY")
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     resp = client.embeddings.create(model=model, input=texts)
@@ -295,7 +373,7 @@ def get_embeddings(
             raise SystemExit("Missing OPENAI_API_KEY environment variable.")
         return embed_openai(texts, model=model, api_key=settings.OPENAI_API_KEY)
 
-    if embedder == "openrouter": # OpenRouter also uses OpenAI compatible API
+    elif embedder == "openrouter": # OpenRouter also uses OpenAI compatible API
         if not settings.OPENROUTER_API_KEY:
             raise SystemExit("Missing OPENROUTER_API_KEY environment variable.")
         if not settings.OPENROUTER_BASE_URL: # Assuming base URL is also needed for OpenRouter
@@ -303,34 +381,34 @@ def get_embeddings(
         # OpenRouter uses OpenAI SDK, so pass base_url to embed_xai which is designed for that
         return embed_xai(texts, model=model, base_url=settings.OPENROUTER_BASE_URL, api_key=settings.OPENROUTER_API_KEY)
 
-    if embedder == "xai":
+    elif embedder == "xai":
         if not settings.XAI_API_KEY: # Make sure XAI_API_KEY is defined in your .env
             raise SystemExit("Missing XAI_API_KEY environment variable.")
         base_url = os.getenv("XAI_BASE_URL", rag_config.get("xai_base_url", "https://api.x.ai/v1")) # Can be in .env or rag_config
         return embed_xai(texts, model=model, base_url=base_url, api_key=settings.XAI_API_KEY)
 
-    if embedder == "gemini":
+    elif embedder == "gemini":
         if not settings.GOOGLE_API_KEY:
             raise SystemExit("Missing GOOGLE_API_KEY environment variable.")
         gemini_task_type = rag_config.get("gemini_embed_task_type", None) # Can be configured in rag_config
         return embed_gemini_batch(texts, model=model, task_type=gemini_task_type, api_key=settings.GOOGLE_API_KEY)
 
-    if embedder == "local_hf":
+    elif embedder == "local_hf":
         hf_device = rag_config.get("local_hf_embed_device", "cpu")
         hf_normalize = rag_config.get("local_hf_embed_normalize", False)
         return embed_local_hf(texts, model=model, device=hf_device, normalize=hf_normalize)
 
-    if embedder == "ollama":
+    elif embedder == "ollama":
         if not settings.OLLAMA_BASE_URL: # Assuming OLLAMA_BASE_URL is in .env
             raise SystemExit("Missing OLLAMA_BASE_URL environment variable.")
         return embed_ollama(texts, model=model, ollama_url=settings.OLLAMA_BASE_URL)
 
-    if embedder == "litellm":
+    elif embedder == "litellm":
         # For LiteLLM, model and API keys are often managed by LiteLLM's own env vars/config
         # We pass it as is, assuming LiteLLM is configured globally
         return embed_litellm(texts, model=model)
 
-    if embedder == "voyage":
+    elif embedder == "voyage":
         if not settings.VOYAGE_API_KEY: # Voyage API Key assumed in .env
             raise SystemExit("Missing VOYAGE_API_KEY environment variable.")
         voyage_input_type = rag_config.get("voyage_embed_input_type", "document")
@@ -384,6 +462,12 @@ def main() -> None:
         help="Path to the JSONL file containing preprocessed child chunks (from Phase A)."
     )
     parser.add_argument(
+        "--phase-prefix",
+        type=str,
+        default="phase_b_embeddings", # Set a sensible default
+        help="A prefix identifying the phase for the vector store (e.g., 'phase_b_embeddings')."
+    )
+    parser.add_argument(
         "--parents-path",
         type=Path,
         default=None, # Will be dynamically built if not provided
@@ -401,6 +485,14 @@ def main() -> None:
         choices=["local", "http"],
         default="local",
         help="ChromaDB client mode (local or http)."
+    )
+
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
     )
     parser.add_argument(
         "--chroma-host",
@@ -508,10 +600,16 @@ def main() -> None:
 
     args = parser.parse_args()
     
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format='%(asctime)s - %(levelname)s - %(message)s')
+
+    
+    
     # --- Setup ---
     project_root = Path(__file__).resolve().parents[1]
     
     settings = load_settings()
+    
+
     config_yaml = {}
     if args.config_path.exists():
         with args.config_path.open("r", encoding="utf-8") as f:
@@ -519,16 +617,17 @@ def main() -> None:
     rag_config = config_yaml.get("rag", {})
     llm_config = config_yaml.get("llm", {})
 
+
     #  NEW: Calculate the overall_rag_pipeline_config_hash ---
     overall_rag_pipeline_config_hash = get_config_hash(rag_config)
     logger.info(f"Overall RAG pipeline config hash for this run: {overall_rag_pipeline_config_hash}")
 
     # Determine embedder_provider and embedding_model, prioritizing CLI args then config.yaml defaults
-    embedder_provider = rag_config.get("embedding_provider", llm_config.get("provider", "openrouter"))
-    embedding_model = rag_config.get("embedding_model", "text-embedding-3-small")
+    embedder_provider = args.embedder or rag_config.get("embedding_provider", llm_config.get("provider", "openrouter"))
+    embedding_model = args.model or rag_config.get("embedding_model", "text-embedding-3-small")
     
     # Determine vector store provider from CLI --vector-store-provider or config.yaml
-    vector_store_global_config = full_config.get("vector_store", {}) # Get the new vector_store section from config.yaml
+    vector_store_global_config = config_yaml.get("vector_store", {}) # Get the new vector_store section from config.yaml
     selected_vector_store_provider = args.vector_store_provider or vector_store_global_config.get("provider", "chroma")
     
     
@@ -545,6 +644,29 @@ def main() -> None:
         logger.critical("Chunk dataclass not available. Check scripts/rag/components/chunkers.py import.")
         sys.exit(1)
     
+    def model_slug(name: str) -> str:
+        return name.replace(" ", "-").replace("/", "-").lower()
+
+    vector_store_name_parts = []
+
+# --- ADD THE NEW DYNAMIC PHASE PREFIX HERE ---
+# The slug function will handle converting spaces/slashes if they were in the prefix,
+# but for simple "phase_b_embeddings", it will just return it as is.
+    vector_store_name_parts.append(model_slug(args.phase_prefix))
+# --- END NEW DYNAMIC PHASE PREFIX ---
+
+    vector_store_name_parts.append(model_slug(args.output_suffix_chunking_strategy))
+    if args.output_suffix_doc_type:
+        vector_store_name_parts.append(model_slug(args.output_suffix_doc_type))
+    vector_store_name_parts.append(model_slug(embedder_provider))
+    vector_store_name_parts.append(model_slug(embedding_model))
+
+    vector_store_name = "_".join(vector_store_name_parts)
+
+    persistence_directory = Path(args.vector_store_base_path) / vector_store_name
+
+    logger.info(f"Vector Store persistence path: {persistence_directory}")
+
     # --- RECONSTRUCT DYNAMIC CHROMADB PATH ---
     # --- Dynamic default for input JSONL paths (aligned with Phase A outputs) ---
     dynamic_jsonl_suffix_parts = []
@@ -713,10 +835,12 @@ def main() -> None:
     for child_chunk in child_chunks_to_embed:
         if child_chunk.metadata and "parent_chunk_id" in child_chunk.metadata:
             parent_chunk_ids_referenced_by_children.add(child_chunk.metadata["parent_chunk_id"])
+    
+    original_parent_chunks_before_filtering = parent_chunks_to_store
 
+    parent_chunks_to_store = []
 
-    parent_chunks_to_store: List[Chunk] = []
-    for parent_chunk in parent_chunks_from_file:
+    for parent_chunk in original_parent_chunks_before_filtering:
         prefixed_parent_id = f"{args.id_prefix}::{parent_chunk.id}" if args.id_prefix else parent_chunk.id
         if prefixed_parent_id in parent_chunk_ids_referenced_by_children:
             parent_chunks_to_store.append(parent_chunk)
@@ -735,16 +859,30 @@ def main() -> None:
         
         metadatas_for_store = []
         for c in batch:
-            meta_copy = c.metadata.copy()
+            meta_copy = dict(c.metadata or {})
             if args.id_prefix and "parent_chunk_id" in meta_copy and not meta_copy["parent_chunk_id"].startswith(f"{args.id_prefix}::"):
                 meta_copy["parent_chunk_id"] = f"{args.id_prefix}::{meta_copy['parent_chunk_id']}"
             
             meta_copy["pipeline_config_hash"] = overall_rag_pipeline_config_hash 
             metadatas_for_store.append(safe_meta(meta_copy))
 
+        # BEFORE embedding (embeddings_list does not exist yet)
+        logger.info(
+        f"lens (pre-embed): ids={len(ids_for_store)} "
+        f"docs={len(texts_to_embed)} metas={len(metadatas_for_store)}"
+        )
+        
         try:
             embeddings_list = embedder_callable(texts_to_embed)
-            
+
+            logger.info(
+                f"lens (post-embed): ids={len(ids_for_store)} "
+                f"docs={len(texts_to_embed)} embs={len(embeddings_list)} "
+                f"metas={len(metadatas_for_store)}"
+            )
+            assert len(ids_for_store) == len(texts_to_embed) == len(embeddings_list) == len(metadatas_for_store)
+            validate_chroma_metadatas(metadatas_for_store)
+
             child_chunks_store.add(
                 ids=ids_for_store,
                 embeddings=embeddings_list,
@@ -755,6 +893,7 @@ def main() -> None:
             logger.info(f"Embedded batch {i+1}/{len(batches_to_embed)} (Total: {total_embedded} child chunks).")
         except Exception as e:
             logger.error(f"Error embedding batch {i+1}: {e}. Skipping batch.", exc_info=True)
+            raise
             
         if args.sleep > 0:
             time.sleep(args.sleep)

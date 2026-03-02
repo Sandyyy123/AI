@@ -88,7 +88,20 @@ class ChromaVectorStore(BaseVectorStore):
         self.persist_directory = config.get("persist_directory")
         self.host = config.get("host")
         self.port = config.get("port")
-        self.collection_metadata = config.get("collection_metadata", {})
+
+        # 1. Capture the initial collection_metadata from config
+        initial_metadata = config.get("collection_metadata", {})
+        
+        # 2. Check if 'hnsw:space' is missing from the metadata
+        if "hnsw:space" not in initial_metadata:
+        # 3. If missing, add 'hnsw:space' with a default value ('cosine' is typical for text embeddings)
+            initial_metadata["hnsw:space"] = "cosine" 
+        
+        logger.info(f"Adding default 'hnsw:space': 'cosine' to collection_metadata for '{self.collection_name}'.")
+
+        # 4. Assign the potentially modified metadata back to self.collection_metadata
+        self.collection_metadata = initial_metadata
+
         self.overwrite = config.get("overwrite", False)
 
         if not self.collection_name:
