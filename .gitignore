@@ -40,3 +40,4 @@ Thumbs.db
 # =====================
 .vscode/
 *.code-workspaceself_rag/
+notebooks/*.code-workspace
