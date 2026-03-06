@@ -32,6 +32,11 @@ data/corpus/courses/
 tools/
 workflows/
 .tmp/
+courses/
+moessingen-agents/
+moessingen_agents/
+tab-organizer/
+.gradio/
 
 # =====================
 # Vector DB / embeddings
