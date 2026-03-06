@@ -28,6 +28,10 @@ __pycache__/
 rag_part_four_env/
 rag_part_five_env/
 data/MNIST
+data/corpus/courses/
+tools/
+workflows/
+.tmp/
 
 # =====================
 # Vector DB / embeddings
@@ -37,6 +41,16 @@ faiss_index/
 vector_store/
 chroma_db_*/
 qdrant_storage/
+
+# =====================
+# WAT Framework
+# =====================
+.tmp/*
+!.tmp/.gitkeep
+credentials.json
+token.json
+token_youtube.json
+.claude.local.md
 
 # =====================
 # OS files
@@ -50,3 +64,4 @@ Thumbs.db
 .vscode/
 *.code-workspaceself_rag/
 notebooks/*.code-workspace
+/root/.notebooklm/storage_state.json
