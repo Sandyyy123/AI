@@ -1,6 +1,103 @@
 # Commands & Tools Reference
 
-> Auto-updated whenever new scripts are added. Last updated: 2026-03-06 (added sync_grover_tools.py + full agent ideas section).
+> Auto-updated whenever new scripts are added. Last updated: 2026-03-06 (Added TimelinesAI tools: send, fetch, summarize, group_update).
+
+---
+
+## TimelinesAI — WhatsApp Automation
+
+Three tools for automated WhatsApp messaging and conversation summarization via the [TimelinesAI](https://app.timelines.ai) REST API.
+
+**Required .env keys:**
+```
+TIMELINESAI_API_KEY=<from https://app.timelines.ai/integrations/api/>
+TIMELINESAI_SENDER_PHONE=<your connected WhatsApp number, e.g. +491234567890>
+```
+
+---
+
+### `timelinesai_send.py` — Send WhatsApp messages (single or bulk)
+
+```bash
+# Single message
+python tools/timelinesai_send.py --phone +491234567890 --message "Hello!"
+
+# Bulk from CSV (columns: phone,message)
+python tools/timelinesai_send.py --csv .tmp/recipients.csv
+
+# Preview without sending
+python tools/timelinesai_send.py --phone +491234567890 --message "Hello!" --dry-run
+```
+
+**Output:** `.tmp/timelinesai_send_results.json`
+**Rate limit:** 2–4s delay between sends (anti-spam)
+
+---
+
+### `timelinesai_fetch_chats.py` — Fetch chat history
+
+```bash
+# Fetch all chats (metadata only)
+python tools/timelinesai_fetch_chats.py
+
+# Fetch chats + full message history
+python tools/timelinesai_fetch_chats.py --with-messages
+
+# Limit to 20 chats with messages
+python tools/timelinesai_fetch_chats.py --limit 20 --with-messages
+
+# Only unread chats
+python tools/timelinesai_fetch_chats.py --unread-only --with-messages
+```
+
+**Output:** `.tmp/timelinesai_chats.json`
+
+---
+
+### `timelinesai_summarize.py` — Summarize conversations with GPT-4o-mini
+
+```bash
+# Daily digest of all chats (fetches automatically if no local file)
+python tools/timelinesai_summarize.py --mode daily
+
+# Daily digest, fetch fresh data
+python tools/timelinesai_summarize.py --mode daily --fetch
+
+# Only summarize unread chats
+python tools/timelinesai_summarize.py --mode daily --unread-only --fetch
+
+# Deep summary of a single chat
+python tools/timelinesai_summarize.py --mode chat --chat-id <chat_id>
+
+# Use existing local chats file
+python tools/timelinesai_summarize.py --mode daily --input .tmp/timelinesai_chats.json
+```
+
+**Output:** `.tmp/timelinesai_summary.json` + printed to stdout
+**Requires:** `OPENAI_API_KEY` + `TIMELINESAI_API_KEY`
+
+---
+
+### `timelinesai_group_update.py` — Summarize a group and send the update back
+
+One-command pipeline: finds group by name → fetches messages → summarizes → sends update to the group.
+
+```bash
+# Full pipeline: summarize + send
+python tools/timelinesai_group_update.py --group "6 Months Outkill Engineering"
+
+# Summarize only, no send
+python tools/timelinesai_group_update.py --group "6 Months Outkill Engineering" --summarize-only
+
+# Preview without sending
+python tools/timelinesai_group_update.py --group "6 Months Outkill Engineering" --dry-run
+
+# Summarize last 50 messages only
+python tools/timelinesai_group_update.py --group "6 Months Outkill Engineering" --last 50
+```
+
+**Output:** `.tmp/timelinesai_group_update.json` + summary printed to stdout
+**Requires:** `TIMELINESAI_API_KEY`, `TIMELINESAI_SENDER_PHONE`, `OPENAI_API_KEY`
 
 ---
 
@@ -467,7 +564,9 @@ Output: `.tmp/youtube_transcripts.json`
 
 ### `summarize_video_insights.py` — Extract insights using Claude Haiku
 
-Per video: summary, key lessons, tools mentioned, techniques, difficulty, monetization tips, action item, worth_watching flag. Updates cumulative `tools_mentioned.json` tracker.
+Per video: summary, key lessons, tools mentioned, techniques, difficulty, monetization tips, action item, `worth_watching` flag, **`relevance_score` (0–10)**, `claude_code_relevant` flag, and `key_timestamps`. Updates cumulative `tools_mentioned.json` tracker.
+
+Scoring guide: 9-10 = specific tools + real code + novel techniques; 7-8 = named tools + actionable; 5-6 = general but useful; <5 = vague/filler.
 
 ```bash
 python tools/summarize_video_insights.py
@@ -476,6 +575,24 @@ python tools/summarize_video_insights.py --dry-run
 ```
 Output: `.tmp/youtube_insights.json` + `.tmp/tools_mentioned.json`
 Cost: ~$0.002/video (Claude Haiku)
+
+---
+
+### `extract_learning_notes.py` — Build Claude Code study notes from top videos
+
+Filters videos with `relevance_score >= 7` (or `claude_code_relevant=true`), then uses Claude Haiku to extract: core concept, Claude Code skills, agent patterns, commands/syntax, timestamped key moments, mistakes to avoid, and a build idea. Outputs a structured Markdown study guide.
+
+```bash
+python tools/extract_learning_notes.py                  # relevance >= 7
+python tools/extract_learning_notes.py --min-score 6    # lower threshold
+python tools/extract_learning_notes.py --all            # all videos regardless of score
+python tools/extract_learning_notes.py --dry-run        # print first 3000 chars
+```
+
+Output: `.tmp/claude_code_notes_YYYY-MM-DD.md` + `.tmp/learning_moments.json`
+Cost: ~$0.003/video (Claude Haiku)
+
+**Run after `summarize_video_insights.py`.**
 
 ---
 
@@ -499,6 +616,7 @@ cd /root/AI && source .venv/bin/activate && \
 python tools/fetch_youtube_ai_videos.py && \
 python tools/extract_youtube_transcript.py && \
 python tools/summarize_video_insights.py && \
+python tools/extract_learning_notes.py && \
 python tools/save_learning_digest.py
 ```
 
@@ -596,6 +714,85 @@ UPWORK_PORTFOLIO="..."
 
 ---
 
+## Jay Shah Meeting Tools
+
+Tools to summarize email history and create a Calendly invite. Run them in sequence.
+
+---
+
+### `summarize_jay_shah_emails.py` — Summarize last 30 days of emails from Jay Shah
+
+Fetches all emails from Jay Shah via Gmail API, sends them to GPT-4o, and produces a structured Markdown summary with: who Jay Shah is, key topics, action items, open questions, a suggested meeting agenda, and recommended meeting duration.
+
+```bash
+python tools/summarize_jay_shah_emails.py
+```
+
+Output: terminal + `.tmp/jay_shah_email_summary.md`
+
+**Requires:** Google OAuth (`credentials.json` + `token.json`), `OPENAI_API_KEY` in `.env`
+
+---
+
+### `create_calendly_invite.py` — Create a one-time Calendly scheduling link
+
+Fetches your Calendly event types, picks the best duration (auto-detected from the email summary or specified manually), and creates a single-use booking link to share with Jay Shah.
+
+```bash
+python tools/create_calendly_invite.py                  # auto-pick duration from email summary
+python tools/create_calendly_invite.py --duration 30    # force 30-min event type
+python tools/create_calendly_invite.py --list-types     # just list event types
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--duration` | No | Preferred event duration in minutes (30, 45, 60). Falls back to shortest type |
+| `--list-types` | No | Print available Calendly event types and exit |
+
+Output: terminal + `.tmp/jay_shah_calendly_link.txt`
+
+**Requires:** `CALENDLY_API_KEY` in `.env`
+
+---
+
+### `create_zoom_meeting.py` — Create a Zoom meeting link
+
+Creates a Zoom meeting via the Zoom API and prints the join URL. Works for any meeting with any attendee.
+
+```bash
+python tools/create_zoom_meeting.py                                       # defaults: "Meeting", 60 min
+python tools/create_zoom_meeting.py --topic "Jay Shah Kickoff" --duration 60
+python tools/create_zoom_meeting.py --topic "Team Sync" --duration 30 --start "2026-03-10T14:00:00" --timezone "America/New_York"
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--topic` | No | Meeting title (default: "Meeting") |
+| `--duration` | No | Duration in minutes (default: 60) |
+| `--start` | No | Start time in ISO 8601 format, e.g. `2026-03-10T14:00:00` (default: ASAP) |
+| `--timezone` | No | Timezone string (default: `UTC`). Example: `America/New_York` |
+
+Output: terminal + `.tmp/zoom_meeting_link.txt`
+
+**Requires in `.env`:**
+- `ZOOM_ACCOUNT_ID`
+- `ZOOM_CLIENT_ID`
+- `ZOOM_CLIENT_SECRET`
+
+Setup: marketplace.zoom.us → Create "Server-to-Server OAuth" app → Add scope `meeting:write` → copy the 3 keys.
+
+---
+
+### Full workflow
+
+```bash
+cd /root/AI && source .venv/bin/activate
+python tools/summarize_jay_shah_emails.py   # step 1: read emails + generate agenda
+python tools/create_calendly_invite.py      # step 2: create invite link
+```
+
+---
+
 ## Grover Tools Sync
 
 ### `sync_grover_tools.py` — Regenerate scriptSources.ts and push to GitHub
@@ -616,17 +813,228 @@ python tools/sync_grover_tools.py --dry-run    # regenerate file only, no git
 
 ---
 
+## WAT Infrastructure Tools
+
+Shared helpers used by all pipelines. Import as modules or run standalone.
+
+---
+
+### `validate_input.py` — Input sanitization helper
+
+Strips shell metacharacters from string args before they reach API calls or subprocesses.
+
+```python
+from tools.validate_input import sanitize, sanitize_url, sanitize_path, sanitize_date, sanitize_time
+```
+
+| Function | Use for |
+|----------|---------|
+| `sanitize(s)` | Titles, organizer names, descriptions — strips `; & | $ < > { }` |
+| `sanitize_url(url)` | Zoom URLs, API endpoints — validates https:// and no shell chars |
+| `sanitize_path(p)` | File/dir paths — resolves and validates, optional `must_exist=True` |
+| `sanitize_date(s)` | YYYY-MM-DD format validation |
+| `sanitize_time(s)` | HH:MM format validation |
+
+---
+
+### `check_env.py` — .env key existence checker
+
+Checks only for key *presence* (never reads or prints values). Safe to run any time.
+
+```bash
+python tools/check_env.py                      # all pipelines
+python tools/check_env.py --pipeline upwork
+python tools/check_env.py --pipeline zoom
+python tools/check_env.py --all
+```
+
+---
+
+### `manifest.py` — .tmp/ pipeline manifest
+
+Records which steps completed. Dependent tools call `assert_step_done()` to block out-of-order runs.
+
+```bash
+python tools/manifest.py           # show status table
+python tools/manifest.py --clear   # wipe manifest (start fresh)
+```
+
+```python
+from tools.manifest import write_entry, assert_step_done
+assert_step_done("fetch_upwork_jobs")   # exits 1 if prerequisite not done
+write_entry("my_tool", outputs=["file.json"], count=12)
+```
+
+---
+
+### `preflight.py` — Pre-flight environment check
+
+Validates keys, OAuth files, token expiry, Python deps, and .tmp/ writability before any pipeline run.
+
+```bash
+python tools/preflight.py                      # check all pipelines
+python tools/preflight.py --pipeline upwork
+python tools/preflight.py --pipeline zoom
+python tools/preflight.py --fix               # auto-refresh expiring OAuth token
+```
+
+Exit: `0` = all passed, `1` = failures found.
+
+---
+
+### `run_pipeline.py` — Pipeline orchestrator
+
+Single-command entry point for any pipeline. Runs preflight, then chains tools in order with proper exit-code handling.
+
+```bash
+python tools/run_pipeline.py upwork
+python tools/run_pipeline.py upwork --dry-run --threshold 6 --top 5
+python tools/run_pipeline.py upwork --force --skip-preflight
+python tools/run_pipeline.py zoom --date 2026-03-08 --organizer "Outskill"
+python tools/run_pipeline.py zoom --date 2026-03-08 --organizer "GEF C4" --direct
+python tools/run_pipeline.py status           # show manifest table
+python tools/run_pipeline.py manifest --clear
+```
+
+| Argument | Pipeline | Description |
+|----------|----------|-------------|
+| `--dry-run` | upwork | Print only, no file writes |
+| `--force` | upwork | Re-run even if output files exist |
+| `--threshold N` | upwork | Min score to generate proposals (default: 7) |
+| `--top N` | upwork | Only generate proposals for top N jobs |
+| `--skip-preflight` | both | Bypass preflight checks |
+| `--direct` | zoom | Direct-invite flow (no Zoom registration) |
+| `--total-duration N` | zoom | Meeting length in minutes (default: 180) |
+
+---
+
 ## Skills (`/skill` commands)
 
 Skills are invoked automatically by Claude based on intent, or explicitly with `/skill-name`.
 
 | Skill | Trigger | Description |
 |-------|---------|-------------|
+| `/preflight` | "check if ready", "are my keys set?", "validate setup" | Pre-flight: keys, OAuth, token expiry, deps, .tmp/ writability |
+| `/pipeline-status` | "what has run?", "show manifest", "what's in .tmp?" | Shows .tmp/manifest.json — steps completed, counts, timestamps |
+| `/morning-brief` | "morning check", "any new Upwork jobs?", "quick scan" | Fetch + score only — no proposals, ~$0.02, fast daily check |
 | `/youtube-ai-tracker` | "track YouTube AI videos", "what's new in AI agents on YouTube", "learn from AI agent videos" | Fetches latest AI agent YouTube videos, extracts transcripts, summarizes insights, saves daily digest |
-| `/upwork-applier` | "find Upwork jobs", "generate Upwork proposals", "check Upwork" | Fetches new Upwork listings, scores for fit, generates tailored proposals, logs to Google Sheets |
-| `/notebooklm` | "create a podcast", "generate a quiz", or any NotebookLM task | Full NotebookLM API — create notebooks, add sources, generate podcasts/quizzes/flashcards/videos/infographics/slide decks, download artifacts |
+| `/upwork-applier` | "find Upwork jobs", "generate Upwork proposals", "check Upwork" | Full pipeline: fetch → score → proposals → track to Google Sheets |
+| `/notebooklm` | "create a podcast", "generate a quiz", or any NotebookLM task | Full NotebookLM API — create notebooks, add sources, generate all artifact types |
 | `/notebooklm-courses` | "upload courses to NotebookLM", "create notebooks from courses" | Creates one NotebookLM notebook per course folder and uploads all PDFs as sources |
 | `/html-to-pdf` | "convert HTML to PDF", "export page as PDF", "save as PDF" | Guides conversion using `weasyprint` (HTML files), `playwright` (URLs/JS-heavy), or `wkhtmltopdf` (system tool) |
+
+---
+
+## RAG Improvement Pipeline
+
+Tools for studying reference GitHub repos, identifying RAG technique gaps, generating scripts, and chatting with Claude using all repos as context. Full SOP: `workflows/rag_improvement.md`.
+
+---
+
+### `rag_dashboard.py` — Terminal dashboard for current RAG state
+
+Shows cached repos, coverage %, gaps, generated scripts, and recent pipeline steps.
+
+```bash
+python tools/rag_dashboard.py
+```
+
+---
+
+### `fetch_github_repo.py` — Fetch and cache a GitHub repo
+
+Downloads full file tree + content to `.tmp/repos/<owner>__<repo>/`. Supports partial fetches.
+
+```bash
+python tools/fetch_github_repo.py --repo Sandyyy123/GenAIEngineering-Cohort3
+python tools/fetch_github_repo.py --repo NirDiamant/RAG_Techniques --tree-only   # fast scan first
+python tools/fetch_github_repo.py --repo NirDiamant/RAG_Techniques --force        # re-fetch
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--repo` | `owner/repo` format |
+| `--tree-only` | Only fetch file tree, not content (faster for large repos) |
+| `--force` | Re-fetch even if already cached |
+
+**Requires:** `GITHUB_TOKEN` in `.env` (avoids rate limits).
+
+---
+
+### `browse_repo.py` — Terminal browser for cached repos
+
+List files, search for keywords, or view a specific file from a cached repo.
+
+```bash
+python tools/browse_repo.py --list                                               # all cached repos
+python tools/browse_repo.py --repo Sandyyy123/GenAIEngineering-Cohort3 --path . # list root
+python tools/browse_repo.py --repo Sandyyy123/GenAIEngineering-Cohort3 --search "chunking"
+python tools/browse_repo.py --repo Sandyyy123/GenAIEngineering-Cohort3 --file src/chunker.py
+```
+
+---
+
+### `analyze_rag_concepts.py` — Scan repo for RAG gaps
+
+Compares 26 tracked RAG concepts against `/root/AI` codebase. Saves gap report to `.tmp/rag_gap_report.json`. Uses GPT-4o-mini for priority recommendations.
+
+```bash
+python tools/analyze_rag_concepts.py --repo Sandyyy123/GenAIEngineering-Cohort3
+python tools/analyze_rag_concepts.py --repo Sandyyy123/GenAIEngineering-Cohort3 --dry-run
+```
+
+Output: `.tmp/rag_gap_report.json`
+Cost: ~$0.001 (GPT-4o-mini)
+
+---
+
+### `generate_rag_script.py` — Generate a Python script for a RAG gap
+
+Takes a technique from the gap report, reads reference code, uses GPT-4o to generate a production-ready script.
+
+```bash
+python tools/generate_rag_script.py --list                            # see available gaps
+python tools/generate_rag_script.py --technique semantic_chunking
+python tools/generate_rag_script.py --technique reranking --dry-run
+```
+
+Output: `tools/generated/<technique>.py`
+Cost: ~$0.02/script (GPT-4o)
+
+---
+
+### `chat_with_repos.py` — Chat with Claude using all cached repos as context
+
+Interactive (or single-question) chat. Searches all 12 cached repos + class notebooks for files relevant to your question, then streams a GPT-4o response.
+
+```bash
+python tools/chat_with_repos.py                                      # interactive mode
+python tools/chat_with_repos.py --question "What chunking am I missing?"
+python tools/chat_with_repos.py --repos RAG_Techniques ragas         # filter repos
+```
+
+| Command (interactive) | Action |
+|-----------------------|--------|
+| `quit` | Exit |
+| `clear` | Reset conversation history |
+| `repos` | List available cached repos |
+
+**Context limits:** Top 5 files per repo, max 80K chars total. History kept to last 10 messages.
+
+Available repos: `RAG_Techniques`, `RAG-Anything`, `ragas`, `graphrag`, `dspy`, `mem0`, `GenAI_Agents`, `ragflow`, `dify`, `OpenScholar`, `Prompt_Engineering`, `GenAIEngineering`
+
+---
+
+### Full RAG improvement pipeline
+
+```bash
+cd /root/AI && source .venv/bin/activate
+python tools/rag_dashboard.py
+python tools/fetch_github_repo.py --repo Sandyyy123/GenAIEngineering-Cohort3
+python tools/analyze_rag_concepts.py --repo Sandyyy123/GenAIEngineering-Cohort3
+python tools/generate_rag_script.py --list
+python tools/chat_with_repos.py
+```
 
 ---
 
@@ -640,6 +1048,7 @@ Markdown SOPs that describe when and how to use the tools above.
 | `workflows/camtasia_to_mp4.md` | SOP for exporting Camtasia `.trec` recordings to MP4 |
 | `workflows/notebooklm_pipeline.md` | SOP for building a NotebookLM research and artifact pipeline |
 | `workflows/upwork_job_applier.md` | SOP for the Upwork automated job applier pipeline |
+| `workflows/rag_improvement.md` | SOP for the full RAG improvement pipeline (fetch → analyze → generate → chat) |
 
 ---
 
@@ -732,3 +1141,75 @@ source /root/AI/.venv/bin/activate
 - `conver_camtasia_files.py` / `export_camtasia_trec.py` — needs AutoHotkey v2 on Windows
 - `save_course_as_pdf.py` — output path is a Windows path (`/mnt/c/...`)
 - `generate_notebooklm_artifacts.py` — output path is a Windows path
+
+---
+
+## Web Apps — Gradio / Streamlit / FastAPI
+
+Three UI frameworks implemented as learning exercises. All apps live in dedicated folders.
+
+### Gradio Apps (`gradio_apps/`)
+
+```bash
+source .venv/bin/activate
+
+# App 1: Simple GPT-4o chat (model picker + system prompt)
+python gradio_apps/1_simple_chat.py          # → http://localhost:7860
+
+# App 2: Repo chat (search 12 cached GitHub repos)
+python gradio_apps/2_repo_chat.py            # → http://localhost:7861
+
+# App 3: RAG pipeline chat (ChromaDB + upload & index tab)
+PYTHONPATH=. python gradio_apps/3_rag_chat.py  # → http://localhost:7862
+
+# All support share=True for a public URL (set in launch() call)
+```
+
+### Streamlit App (`streamlit_apps/`)
+
+```bash
+# Polished dark sidebar chat — repo mode + simple chat mode
+streamlit run streamlit_apps/rag_chat.py --server.address 0.0.0.0 --server.port 8501
+# → http://localhost:8501
+```
+
+### FastAPI + HTML Web App (`web_app/`)
+
+```bash
+# Backend API (streaming SSE + /repos endpoint)
+PYTHONPATH=. uvicorn web_app.backend:app --host 0.0.0.0 --port 8000 --reload
+# → http://localhost:8000  (serves index.html at /)
+```
+
+**Skills saved:**
+- `~/.claude/skills/streamlit-app.md` — trigger: "build a streamlit app"
+- `~/.claude/skills/web-app-from-scratch.md` — trigger: "build a web app" / "Lovable-style"
+
+---
+
+## Upwork Playwright Scraper
+
+Replaces broken RSS feeds. Uses Playwright + Cloudflare session cookies.
+
+```bash
+# Requires in .env: UPWORK_MASTER_TOKEN, UPWORK_XSRF_TOKEN, UPWORK_USER_UID, UPWORK_CF_CLEARANCE
+python tools/fetch_upwork_playwright.py --dry-run --query "AI agent" --hours-old 2
+python tools/fetch_upwork_playwright.py --query "AI agent" --query "Python developer"
+```
+
+**Cookie refresh:** Get fresh `cf_clearance` from Chrome DevTools → Application → Cookies → upwork.com when scraper returns 0 results.
+
+---
+
+## YouTube Playlist Tool
+
+Fetches playlists and videos from YouTube channel via Google OAuth.
+
+```bash
+python tools/get_youtube_playlists.py
+# Saves to .tmp/youtube_playlists.json
+# Uses token_youtube.json (separate from Zoom token.json)
+```
+
+**Setup:** Requires YouTube Data API v3 scope in Google Cloud Console + http://localhost:8080 redirect URI.
+
